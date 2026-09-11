@@ -1002,6 +1002,7 @@ export function emptyEndingNote(opts: {
   surfaceTools: boolean;
   pollFire: boolean;
   ref: {
+    peerWaitId?: string;
     runtimeHandoff?: unknown;
     silentRequested?: boolean;
     pausedOnApproval?: boolean;
@@ -1015,6 +1016,7 @@ export function emptyEndingNote(opts: {
   if (opts.wallClock !== "ok" || opts.userAborted || opts.cancelled || opts.surfaceTools) return null;
   if (
     opts.ref.runtimeHandoff ||
+    opts.ref.peerWaitId ||
     opts.ref.silentRequested ||
     opts.ref.pausedOnApproval ||
     opts.ref.pendingApprovals?.length
@@ -1737,6 +1739,8 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           const turnWallClockMs = turn.turnWallClockMs ?? defaultTurnWallClockMs;
           entry.ref.current = turn.tools;
           entry.ref.onExecutionPending = turn.onExecutionPending;
+          entry.ref.suspendPeerWait = turn.suspendPeerWait;
+          entry.ref.peerWaitId = undefined;
           entry.ref.runtimeHandoff = undefined;
           entry.ref.runtimeMutationPending = false;
           entry.ref.runtimeInFlight = new Set();
@@ -2073,7 +2077,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
                           swallow("pi: steer persist", e);
                         }
                       }
-                      if (entry.agentSession.isStreaming) entry.ref.silentRequested = false;
+                      if (entry.agentSession.isStreaming && !entry.ref.peerWaitId) entry.ref.silentRequested = false;
                       if (peerOrigin) entry.peerInputs.add(peerOrigin.deliveryId, peerOrigin, text);
                       await entry.agentSession.steer(text);
                     },
@@ -2171,6 +2175,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
                   userAborted ||
                   !!turn.cancel?.aborted ||
                   !!entry.ref.runtimeHandoff ||
+                  !!entry.ref.peerWaitId ||
                   !!entry.ref.pausedOnApproval ||
                   !!entry.ref.pendingApprovals?.length,
                 beforePrompt: async (note) => {
@@ -2196,7 +2201,13 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
               wallClock = goalResult.outcome;
               grindWaiverNote = goalResult.waiverNote;
             }
-            if (wallClock === "ok" && !entry.ref.runtimeHandoff && !userAborted && !turn.cancel?.aborted) {
+            if (
+              wallClock === "ok" &&
+              !entry.ref.runtimeHandoff &&
+              !entry.ref.peerWaitId &&
+              !userAborted &&
+              !turn.cancel?.aborted
+            ) {
               const refusal = providerRefusalError(entry.agentSession, messagesBefore);
               if (refusal) {
                 try {
@@ -2370,10 +2381,12 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
             await tapeEntryMirror(goalEntry);
             if (g.status === "complete" || g.status === "blocked") entry.ref.goal = null;
           }
-          const closingText = recoveryDead ? "" : (piLastAssistantTextOrThrow(entry.agentSession) ?? "");
+          const closingText =
+            recoveryDead || entry.ref.peerWaitId ? "" : (piLastAssistantTextOrThrow(entry.agentSession) ?? "");
           const closingTextWithWaiver = [closingText, grindWaiverNote].filter(Boolean).join("\n\n");
           // A stall auto-waive stays visible even when the final stop attempt was a silent finish.
-          const reply = entry.ref.silentRequested && !grindWaiverNote ? "" : closingTextWithWaiver;
+          const reply =
+            entry.ref.peerWaitId || (entry.ref.silentRequested && !grindWaiverNote) ? "" : closingTextWithWaiver;
           const finalEntry = await turn.emit({
             type: "assistant",
             payload: { text: reply },
@@ -2383,7 +2396,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           const pendingApprovals = entry.ref.pendingApprovals ?? [];
           const modelCalls = entry.ref.modelCalls ?? 0;
           const cacheUsage = sumCacheUsage(callStats);
-          const silent = entry.ref.silentRequested ? { silent: true as const } : {};
+          const silent = entry.ref.peerWaitId || entry.ref.silentRequested ? { silent: true as const } : {};
           const base = pendingApprovals.length
             ? {
                 reply,

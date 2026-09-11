@@ -9,6 +9,9 @@ function pat(method: string, template: string, field?: Field): Rule {
 }
 
 const USER_SCOPED: Rule[] = [
+  pat("GET", "/v1/peer-waits", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/peer-waits", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/peer-waits/:id", { in: "query", name: "principalId" }),
   pat("POST", "/v1/peer-spawns", { in: "query", name: "principalId" }),
   pat("POST", "/v1/peers/:id/lifecycle", { in: "query", name: "principalId" }),
   pat("GET", "/v1/peers/:id/subtree", { in: "query", name: "principalId" }),

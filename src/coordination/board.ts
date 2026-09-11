@@ -4,6 +4,7 @@ import type { CoordinationRepository, PeerMessageQuery } from "./repository.ts";
 import { CoordinationError, type AudienceCandidate, type PeerMessage } from "./types.ts";
 
 export interface PublishPeerMessage {
+  continuation?: PeerMessage["continuation"];
   senderId: string;
   senderRunId: string;
   idempotencyKey: string;
@@ -41,7 +42,8 @@ export function createPeerBoard(repository: CoordinationRepository) {
           existing.senderId !== input.senderId ||
           existing.text !== input.text ||
           existing.audience !== input.audience ||
-          existing.replyTo !== (input.replyTo ?? null)
+          existing.replyTo !== (input.replyTo ?? null) ||
+          JSON.stringify(existing.continuation) !== JSON.stringify(input.continuation)
         )
           throw new CoordinationError(409, "idempotency_conflict", "message key already names a different request");
         return existing;
@@ -50,48 +52,52 @@ export function createPeerBoard(repository: CoordinationRepository) {
       if (prior) return sameRequest(prior);
       const snapshot = await candidates();
       const recipientIds = await evaluateAudience(input.audience, snapshot);
-      return repository.transaction([`message:${id}`], async (tx) => {
-        const existing = await tx.get("message", id);
-        if (existing) return sameRequest(existing);
-        const sender = await tx.get("peer", input.senderId);
-        if (!sender || sender.state !== "active")
-          throw new CoordinationError(409, "sender_inactive", "sender is not active");
-        const parent = input.replyTo ? await tx.get("message", input.replyTo) : null;
-        if (input.replyTo && !parent) throw new CoordinationError(404, "message_not_found", "reply target not found");
-        const now = Date.now();
-        const sequence = await tx.event("message", id, now);
-        const message: PeerMessage = {
-          id,
-          senderId: sender.id,
-          senderRunId: input.senderRunId,
-          senderName: sender.name,
-          text: input.text,
-          audience: input.audience,
-          candidates: snapshot,
-          recipientIds,
-          replyTo: input.replyTo ?? null,
-          threadId: parent?.threadId ?? id,
-          createdAt: now,
-          sequence,
-        };
-        await tx.put("message", message);
-        for (const recipientId of recipientIds) {
-          await tx.put("delivery", {
-            id: `${id}:${recipientId}`,
-            messageId: id,
-            recipientId,
-            state: "queued",
-            attempts: 0,
-            runId: null,
-            reason: null,
+      return repository.transaction(
+        [`message:${id}`, ...(input.replyTo ? [`message:${input.replyTo}`] : [])],
+        async (tx) => {
+          const existing = await tx.get("message", id);
+          if (existing) return sameRequest(existing);
+          const sender = await tx.get("peer", input.senderId);
+          if (!sender || sender.state !== "active")
+            throw new CoordinationError(409, "sender_inactive", "sender is not active");
+          const parent = input.replyTo ? await tx.get("message", input.replyTo) : null;
+          if (input.replyTo && !parent) throw new CoordinationError(404, "message_not_found", "reply target not found");
+          const now = Date.now();
+          const sequence = await tx.event("message", id, now);
+          const message: PeerMessage = {
+            ...(input.continuation ? { continuation: input.continuation } : {}),
+            id,
+            senderId: sender.id,
+            senderRunId: input.senderRunId,
+            senderName: sender.name,
+            text: input.text,
+            audience: input.audience,
+            candidates: snapshot,
+            recipientIds,
+            replyTo: input.replyTo ?? null,
+            threadId: parent?.threadId ?? id,
             createdAt: now,
-            updatedAt: now,
-            leaseToken: null,
-            leaseUntil: 0,
-          });
-        }
-        return message;
-      });
+            sequence,
+          };
+          await tx.put("message", message);
+          for (const recipientId of recipientIds) {
+            await tx.put("delivery", {
+              id: `${id}:${recipientId}`,
+              messageId: id,
+              recipientId,
+              state: "queued",
+              attempts: 0,
+              runId: null,
+              reason: null,
+              createdAt: now,
+              updatedAt: now,
+              leaseToken: null,
+              leaseUntil: 0,
+            });
+          }
+          return message;
+        },
+      );
     },
     async get(id: string) {
       const message = await repository.get("message", id);

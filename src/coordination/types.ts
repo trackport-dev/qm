@@ -49,6 +49,7 @@ export interface AudienceCandidate {
 }
 
 export interface PeerMessage {
+  continuation?: { kind: "reply_wait"; waitId: string };
   id: string;
   senderId: string;
   senderRunId: string;
@@ -108,6 +109,10 @@ export interface PeerWait {
   replyIds: string[];
   state: "waiting" | "ready" | "timed_out" | "cancelled" | "resumed";
   deadline: number;
+  timeoutMs: number;
+  suspendedAt: number | null;
+  outcome: "ready" | "timed_out" | null;
+  resumeMessageId: string | null;
   createdAt: number;
   resumeRunId: string | null;
 }

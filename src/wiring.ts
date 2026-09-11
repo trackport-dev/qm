@@ -1,6 +1,8 @@
 import { createRuntimeService } from "./harness/runtime-control.ts";
 import { createPeerIdentity, type PeerIdentity } from "./coordination/identity.ts";
 import { createPeerBoard, type PeerBoard } from "./coordination/board.ts";
+import { createPeerWaits, type PeerWaits } from "./coordination/waits.ts";
+import { createPeerWaitWorker, type PeerWaitWorker } from "./coordination/wait-worker.ts";
 import { createPeerDeliveryLedger } from "./coordination/delivery.ts";
 import { createPeerSpawning, type PeerSpawning } from "./coordination/spawning.ts";
 import { createPeerSpawnWorker, type PeerSpawnWorker } from "./coordination/spawn-worker.ts";
@@ -8,6 +10,7 @@ import { createPeerLifecycle, type PeerLifecycle } from "./coordination/lifecycl
 import { createPeerExecution } from "./coordination/execution.ts";
 import { createMemoryPeerExecutionStore, createPostgresPeerExecutionStore } from "./coordination/execution-store.ts";
 import { createPeerDispatcher, type PeerDispatcher } from "./coordination/dispatcher.ts";
+import { peerInput, verifiedPeerInput } from "./coordination/peer-input.ts";
 import type { Peer, PeerAuthority } from "./coordination/types.ts";
 import {
   createMemoryCoordinationRepository,
@@ -413,6 +416,8 @@ export interface BuiltApp {
   coordinationRepository: CoordinationRepository;
   peerIdentity?: PeerIdentity;
   peerBoard?: PeerBoard;
+  peerWaits?: PeerWaits;
+  peerWaitWorker?: PeerWaitWorker;
   peerDispatcher?: PeerDispatcher;
   peerSpawning?: PeerSpawning;
   peerSpawnWorker?: PeerSpawnWorker;
@@ -555,6 +560,7 @@ export function buildApp(
       })
     : createMemoryCoordinationRepository();
   const peerBoard = config.coordinationEnabled ? createPeerBoard(coordinationRepository) : undefined;
+  const peerWaits = config.coordinationEnabled ? createPeerWaits(coordinationRepository) : undefined;
   const peerDeliveryLedger = config.coordinationEnabled ? createPeerDeliveryLedger(coordinationRepository) : undefined;
   const artifactMap = <T>(table: string): DurableMap<T> =>
     pgArtifactMap ? pgArtifactMap.map<T>(table) : createMemoryMap<T>();
@@ -1533,6 +1539,7 @@ export function buildApp(
   };
   const orchestratorDeps: OrchestratorDeps = {
     peerIdentity,
+    peerWaits,
     sessionSandboxId: async (sessionId) => {
       const peer = await coordinationRepository.get("peer", sessionId);
       if (!peer?.parentId) return undefined;
@@ -1545,6 +1552,7 @@ export function buildApp(
     },
     authorizePeerTurn: async (input) => {
       if (!peerIdentity || input.origin.kind !== "peer") return false;
+      if (!(await verifiedPeerInput(coordinationRepository, input.origin, input.text))) return false;
       const [peer, session] = await Promise.all([
         coordinationRepository.get("peer", input.origin.recipientSessionId),
         sessions.get(input.origin.recipientSessionId),
@@ -1566,6 +1574,12 @@ export function buildApp(
         authority.conversation.threadRef === input.conversation.threadRef &&
         !(await peerBlocked(peer.id))
       );
+    },
+    peerScreenData: async (input) => {
+      const verified =
+        input.origin.kind === "peer" && (await verifiedPeerInput(coordinationRepository, input.origin, input.text));
+      if (!verified) throw new Error("peer input does not match its durable message");
+      return verified.screenData;
     },
     refreshModels,
     identity,
@@ -2038,7 +2052,7 @@ export function buildApp(
         sessions,
         authorize: authorizePeer,
         blocked: peerBlocked,
-        prepareSteer: async (peer, _message, run, text) => {
+        prepareSteer: async (peer, message, run) => {
           const authority = peer.authority;
           if (
             !authority ||
@@ -2048,7 +2062,7 @@ export function buildApp(
           )
             return "followup";
           const decision = await orchestrator.screenSecuritySteer({
-            payload: text,
+            payload: peerInput(message, peer.id).screenData,
             actor: authority.actor,
             conversation: authority.conversation,
             sessionId: peer.id,
@@ -2061,6 +2075,19 @@ export function buildApp(
     : undefined;
   const peerDispatchSweeper = peerDispatcher
     ? createSweeper(() => peerDispatcher.sweep(), 1_000, { label: "peer-dispatch", immediate: true })
+    : undefined;
+  const peerWaitWorker =
+    peerWaits && peerBoard && peerDispatcher && peerExecution
+      ? createPeerWaitWorker({
+          repository: coordinationRepository,
+          waits: peerWaits,
+          board: peerBoard,
+          dispatcher: peerDispatcher,
+          sourceReleased: (wait) => peerExecution.sourceReleased(wait.runId),
+        })
+      : undefined;
+  const peerWaitSweeper = peerWaitWorker
+    ? createSweeper(() => peerWaitWorker.sweep(), 1_000, { label: "peer-waits", immediate: true })
     : undefined;
   const peerSpawning = config.coordinationEnabled ? createPeerSpawning(coordinationRepository) : undefined;
   const peerLifecycle = peerSpawning
@@ -2216,6 +2243,7 @@ export function buildApp(
       wakeSweep.start();
       orphanedSignalSweeper.start();
       peerDispatchSweeper?.start();
+      peerWaitSweeper?.start();
       peerSpawnSweeper?.start();
       peerLifecycleSweeper?.start();
       peerExecutionSweeper?.start();
@@ -2238,6 +2266,7 @@ export function buildApp(
       wakeSweep.stop();
       orphanedSignalSweeper.stop();
       peerDispatchSweeper?.stop();
+      peerWaitSweeper?.stop();
       peerSpawnSweeper?.stop();
       peerLifecycleSweeper?.stop();
       peerExecutionSweeper?.stop();
@@ -2261,7 +2290,9 @@ export function buildApp(
     coordinationRepository,
     peerIdentity,
     peerBoard,
+    peerWaits,
     peerDispatcher,
+    peerWaitWorker,
     peerSpawning,
     peerSpawnWorker,
     peerLifecycle,
@@ -2420,6 +2451,7 @@ export function serverDeps(
     sessions: built.sessions,
     peerIdentity: built.peerIdentity,
     peerBoard: built.peerBoard,
+    peerWaits: built.peerWaits,
     peerSpawning: built.peerSpawning,
     peerLifecycle: built.peerLifecycle,
     peerExecution: built.peerExecution,

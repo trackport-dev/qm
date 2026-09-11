@@ -9,13 +9,31 @@ import {
   createOpenCodeHarness,
   latestAssistantParts,
   openCodeHarnessConfigOptions,
+  waitForSessionIdle,
 } from "../src/harness/opencode-harness.ts";
 import type { OpencodeClient } from "@opencode-ai/sdk";
 import type { Config } from "../src/config.ts";
 import type { HarnessLlmRequestRecord, HarnessTurnInput } from "../src/harness/harness.ts";
 import type { ScopeId, Session, SessionEntry } from "../src/types.ts";
 
-function fakeSidecar(dir: string, name: string, handlers: string): string {
+test("OpenCode idle checks require a successful status response", async () => {
+  const client = (response: unknown) => ({ session: { status: async () => response } }) as unknown as OpencodeClient;
+  for (const response of [
+    {},
+    { error: { message: "unavailable" } },
+    { data: {}, error: { message: "unavailable" } },
+    { data: null },
+  ])
+    await assert.rejects(waitForSessionIdle(client(response), "session", 1000), /could not be verified/);
+  await waitForSessionIdle(client({ data: {} }), "session", 1000);
+  await waitForSessionIdle(client({ data: { session: { type: "idle" } } }), "session", 1000);
+  await assert.rejects(
+    waitForSessionIdle(client({ data: { session: { type: "busy" } } }), "session", 1),
+    /did not settle/,
+  );
+});
+
+function fakeSidecar(dir: string, name: string, handlers: string, distinctSessions = false): string {
   const script = join(dir, `${name}.js`);
   writeFileSync(
     script,
@@ -29,10 +47,11 @@ const capture = async (sessionId, body) =>
     headers: { authorization: "Bearer " + process.env.OPENCODE_BRIDGE_SECRET, "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+let sessionCount = 0;
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
   if (url.pathname === "/global/event") { res.writeHead(200, { "content-type": "text/event-stream" }); res.write("\\n"); return; }
-  if (req.method === "POST" && url.pathname === "/session") { await readBody(req); return json(res, { id: "ses_main" }); }
+  if (req.method === "POST" && url.pathname === "/session") { await readBody(req); sessionCount++; return json(res, { id: ${distinctSessions ? "`ses_${sessionCount}`" : '"ses_main"'} }); }
   const message = url.pathname.match(/^\\/session\\/([^/]+)\\/message$/);
   ${handlers}
   return json(res, {});
@@ -79,7 +98,84 @@ const okAssistant = `{
   parts: [{ id: "prt_1", sessionID: "ses_main", messageID: "msg_1", type: "text", text: "hello from fake" }],
 }`;
 
-for (const evidence of ["accepted", "missing", "rejected", "provider-error", "not-processed"]) {
+for (const hangingCleanup of [false, true]) {
+  test(`OpenCode retains failed transport execution until its sidecar drains unrelated turns and exits (hanging cleanup=${hangingCleanup})`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "qm-opencode-retire-"));
+    const firstStarted = join(dir, "first-started");
+    const secondStarted = join(dir, "second-started");
+    const releaseFirst = join(dir, "release-first");
+    const releaseSecond = join(dir, "release-second");
+    const delayedWork = join(dir, "delayed-work");
+    const binaryPath = fakeSidecar(
+      dir,
+      "retire",
+      `
+    if (${hangingCleanup} && req.method === "DELETE" && url.pathname === "/session/ses_1") return;
+    if (req.method === "POST" && message) {
+      await readBody(req);
+      const fs = require("node:fs");
+      const first = message[1] === "ses_1";
+      fs.writeFileSync(first ? ${JSON.stringify(firstStarted)} : ${JSON.stringify(secondStarted)}, "1");
+      while (!fs.existsSync(first ? ${JSON.stringify(releaseFirst)} : ${JSON.stringify(releaseSecond)}))
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      if (first) {
+        res.destroy();
+        setTimeout(() => fs.writeFileSync(${JSON.stringify(delayedWork)}, "1"), 50);
+        return;
+      }
+      return json(res, ${okAssistant});
+    }
+    if (req.method === "GET" && message) return json(res, [${okAssistant}]);
+  `,
+      true,
+    );
+    const harness = createOpenCodeHarness({ binaryPath, turnWallClockMs: 15_000 });
+    t.after(async () => {
+      await harness.turns.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const waitFor = async (file: string) => {
+      const deadline = Date.now() + 4_000;
+      while (!existsSync(file)) {
+        assert.ok(Date.now() < deadline, `missing fixture event ${file}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+    let released = false;
+    const tracked: Promise<void>[] = [];
+    const failed = assert.rejects(
+      harness.turns.runTurn({
+        ...turnInput([], []),
+        onExecutionPending(operation) {
+          tracked.push(operation);
+          void operation.then(() => {
+            released = true;
+          });
+        },
+      }),
+    );
+    await waitFor(firstStarted);
+    const unrelated = harness.turns.runTurn({ ...turnInput([], []), session: { id: "session-2" } as Session });
+    await waitFor(secondStarted);
+    writeFileSync(releaseFirst, "1");
+    await failed;
+    await waitFor(delayedWork);
+    assert.equal(released, false);
+    assert.equal(tracked.length, 1);
+    const cancelled = new AbortController();
+    const waiting = harness.turns.runTurn({ ...turnInput([], []), cancel: cancelled.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    cancelled.abort();
+    assert.deepEqual(await waiting, { reply: "", stopped: true });
+    assert.equal(released, false);
+    writeFileSync(releaseSecond, "1");
+    assert.equal((await unrelated).reply, "hello from fake");
+    await Promise.all(tracked);
+    assert.equal(released, true);
+  });
+}
+
+for (const evidence of ["accepted", "missing", "rejected", "provider-error", "not-processed", "status-error"]) {
   test(`OpenCode peer receipts require successful submission and user evidence (${evidence})`, async (t) => {
     const dir = mkdtempSync(join(tmpdir(), "qm-opencode-peer-"));
     const started = join(dir, "started");
@@ -88,6 +184,10 @@ for (const evidence of ["accepted", "missing", "rejected", "provider-error", "no
       dir,
       "peer",
       `
+      if (url.pathname === "/session/status" && ${JSON.stringify(evidence)} === "status-error") {
+        res.writeHead(503);
+        return res.end("status unavailable");
+      }
       if (req.method === "POST" && message) {
         await readBody(req);
         require("node:fs").writeFileSync(${JSON.stringify(started)}, "1");

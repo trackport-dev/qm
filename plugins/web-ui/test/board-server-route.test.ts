@@ -33,6 +33,8 @@ test("board proxy binds reads and previews to the authenticated viewer", async (
   for (const path of [
     "/api/peer-messages?principalId=mallory&after=17&text=review",
     "/api/peer-messages/message-id",
+    "/api/peer-waits?principalId=mallory&messageId=request&after=17",
+    "/api/peer-waits/wait-id?principalId=mallory",
     "/api/peers",
     "/api/peers/agent-id/subtree?principalId=mallory",
   ]) {

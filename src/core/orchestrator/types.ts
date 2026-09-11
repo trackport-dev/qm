@@ -104,6 +104,7 @@ export interface OrchestratorInput extends Omit<
 
 export interface OrchestratorDeps {
   peerIdentity?: PeerIdentity;
+  peerWaits?: import("../../coordination/waits.ts").PeerWaits;
   refreshModels?: () => Promise<void>;
   identity: IdentityService;
   resolution: ResolutionService;
@@ -162,6 +163,7 @@ export interface OrchestratorDeps {
   runActivity?: RunActivityStore;
   runs?: RunStore;
   authorizePeerTurn?(input: OrchestratorInput): Promise<boolean>;
+  peerScreenData?(input: OrchestratorInput): Promise<string>;
   acceptPeerInput?(origin: PeerOrigin, sessionId: string, runId: string): Promise<void>;
   sessionSandboxId?(sessionId: string): Promise<string | undefined>;
   sessionCanRun?(threadRef: string): Promise<boolean>;

@@ -20,6 +20,10 @@ export interface ExecutionUsage {
   turnLimit: number;
 }
 export interface PeerExecutionStore {
+  recordStart(runId: string, attempt: number): Promise<void>;
+  recordRelease(runId: string, attempt: number, token: string | null): Promise<void>;
+  wasTokenReleased(runId: string, token: string): Promise<boolean>;
+  wasReleased(runId: string, attempt: number): Promise<boolean>;
   usage(rootId: string, scopeId: string): Promise<ExecutionUsage>;
   admit(input: ExecutionInput): Promise<ExecutionAdmission>;
   orphan(runId: string, token: string): Promise<void>;
@@ -43,8 +47,28 @@ function validateLimits(concurrency: number, turnLimit: number): void {
 export function createMemoryPeerExecutionStore(concurrency = 4, turnLimit = 200): PeerExecutionStore {
   validateLimits(concurrency, turnLimit);
   const rows = new Map<string, PeerExecution>();
+  const released = new Map<string, Map<number, boolean>>();
+  const releasedTokens = new Set<string>();
   const queue = createKeyedQueue();
   return {
+    async recordStart(runId, attempt) {
+      const attempts = released.get(runId) ?? new Map<number, boolean>();
+      if (!attempts.has(attempt)) attempts.set(attempt, false);
+      released.set(runId, attempts);
+    },
+    async recordRelease(runId, attempt, token) {
+      const attempts = released.get(runId) ?? new Map<number, boolean>();
+      attempts.set(attempt, true);
+      released.set(runId, attempts);
+      if (token) releasedTokens.add(JSON.stringify([runId, token]));
+    },
+    async wasTokenReleased(runId, token) {
+      return releasedTokens.has(JSON.stringify([runId, token]));
+    },
+    async wasReleased(runId, attempt) {
+      const attempts = released.get(runId);
+      return attempts?.get(attempt) === true && [...attempts.values()].every(Boolean);
+    },
     async usage(rootId, scopeId) {
       const values = [...rows.values()];
       return {
@@ -122,12 +146,77 @@ export function createPostgresPeerExecutionStore(
     ],
   };
   pg.registerMigration(orphanMigration);
+  const releaseMigration = {
+    id: "coordination/0011-execution-release-receipts",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS coordination_execution_releases (
+        org_id TEXT NOT NULL, run_id TEXT NOT NULL, attempt INTEGER NOT NULL,
+        PRIMARY KEY (org_id, run_id, attempt))`,
+    ],
+  };
+  pg.registerMigration(releaseMigration);
+  const startedMigration = {
+    id: "coordination/0012-execution-start-receipts",
+    statements: [
+      "ALTER TABLE coordination_execution_releases ADD COLUMN IF NOT EXISTS released BOOLEAN NOT NULL DEFAULT true",
+    ],
+  };
+  pg.registerMigration(startedMigration);
+  const tokenMigration = {
+    id: "coordination/0014-execution-termination-tokens",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS coordination_execution_terminations (
+        org_id TEXT NOT NULL, run_id TEXT NOT NULL, token TEXT NOT NULL,
+        PRIMARY KEY (org_id, run_id, token))`,
+    ],
+  };
+  pg.registerMigration(tokenMigration);
   const ready = async () => {
     await pg.migrate(migration);
     await pg.migrate(budgetMigration);
     await pg.migrate(orphanMigration);
+    await pg.migrate(releaseMigration);
+    await pg.migrate(startedMigration);
+    await pg.migrate(tokenMigration);
   };
   return {
+    async recordStart(runId, attempt) {
+      await ready();
+      await pg.q(
+        "INSERT INTO coordination_execution_releases(org_id, run_id, attempt, released) VALUES ($1,$2,$3,false) ON CONFLICT DO NOTHING",
+        [orgId, runId, attempt],
+      );
+    },
+    async recordRelease(runId, attempt, token) {
+      await ready();
+      await withPgTransaction(await pg.pool(), async (client) => {
+        await client.query(
+          "INSERT INTO coordination_execution_releases(org_id, run_id, attempt, released) VALUES ($1,$2,$3,true) ON CONFLICT (org_id, run_id, attempt) DO UPDATE SET released=true",
+          [orgId, runId, attempt],
+        );
+        if (token)
+          await client.query(
+            "INSERT INTO coordination_execution_terminations(org_id, run_id, token) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+            [orgId, runId, token],
+          );
+      });
+    },
+    async wasTokenReleased(runId, token) {
+      await ready();
+      const rows = await pg.q(
+        "SELECT 1 FROM coordination_execution_terminations WHERE org_id=$1 AND run_id=$2 AND token=$3",
+        [orgId, runId, token],
+      );
+      return rows.length > 0;
+    },
+    async wasReleased(runId, attempt) {
+      await ready();
+      const rows = await pg.q(
+        "SELECT 1 FROM coordination_execution_releases WHERE org_id=$1 AND run_id=$2 AND attempt=$3 AND released AND NOT EXISTS (SELECT 1 FROM coordination_execution_releases WHERE org_id=$1 AND run_id=$2 AND NOT released)",
+        [orgId, runId, attempt],
+      );
+      return rows.length > 0;
+    },
     async usage(rootId, scopeId) {
       await ready();
       const rows = await pg.q(

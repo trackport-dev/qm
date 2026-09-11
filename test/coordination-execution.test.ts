@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { createPgPool } from "../src/persistence/pg-pool.ts";
+import { createPeerExecution } from "../src/coordination/execution.ts";
+import { createMemoryCoordinationRepository } from "../src/coordination/repository.ts";
+import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
+import { createMemoryRunStore } from "../src/runs/memory-run-store.ts";
 import {
   createMemoryPeerExecutionStore,
   createPostgresPeerExecutionStore,
@@ -25,6 +29,44 @@ for (const backend of ["memory", "postgres"] as const) {
       const second = backend === "memory" ? first : createPostgresPeerExecutionStore(pools[1]!, org, 2, 3);
       const stores = [first, second];
       const input = { runId: "one", rootId: "root", scopeId: "scope", token: "attempt-one", autonomous: true };
+      assert.equal(await first.wasReleased("release-test", 1), false);
+      await first.recordRelease("release-test", 1, "first");
+      await second.recordRelease("release-test", 1, "first");
+      assert.equal(await second.wasTokenReleased("release-test", "first"), true);
+      assert.equal(await second.wasTokenReleased("release-test", "second"), false);
+      assert.equal(await second.wasTokenReleased("other-run", "first"), false);
+      assert.equal(await second.wasReleased("release-test", 1), true);
+      assert.equal(await second.wasReleased("release-test", 2), false);
+      await first.recordStart("overlapping", 1);
+      await second.recordStart("overlapping", 2);
+      await second.recordRelease("overlapping", 2, "second");
+      assert.equal(await first.wasReleased("overlapping", 2), false);
+      await first.recordRelease("overlapping", 1, "first");
+      assert.equal(await second.wasReleased("overlapping", 2), true);
+      const terminated = {
+        runId: "terminated",
+        rootId: "recovery-root",
+        scopeId: "recovery-scope",
+        token: "terminated-token",
+        autonomous: false,
+      };
+      assert.equal(await first.admit(terminated), "admitted");
+      await first.recordStart(terminated.runId, 1);
+      await first.recordRelease(terminated.runId, 1, terminated.token);
+      assert.equal((await second.active()).length, 1);
+      const recovery = createPeerExecution({
+        store: second,
+        repository: createMemoryCoordinationRepository(),
+        sessions: createMemorySessionStore(),
+        runs: createMemoryRunStore().runs,
+      });
+      await recovery.sweep();
+      assert.deepEqual(await first.active(), []);
+      assert.equal(await first.admit({ ...terminated, token: "replacement-token" }), "admitted");
+      await recovery.sweep();
+      assert.equal((await first.active())[0]?.token, "replacement-token");
+      assert.equal((await first.active())[0]?.orphaned, true);
+      await first.release(terminated.runId, "replacement-token");
       const results = await Promise.all(
         Array.from({ length: 20 }, (_, i) => stores[i % 2]!.admit({ ...input, runId: `run-${i}` })),
       );

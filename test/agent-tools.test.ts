@@ -7,6 +7,83 @@ import { CommandDenied, NeedsApproval, type ToolContext } from "../src/tools/pri
 import type { EntryType, SessionEntry } from "../src/types.ts";
 import type { ComputerStatus } from "../src/sandbox/sandbox.ts";
 
+test("peer waiting persists suspension before terminating and prevents later tools", async () => {
+  const suspended: string[] = [];
+  const ref: ToolContextRef = {
+    current: fakeToolContext(),
+    suspendPeerWait: async (id) => {
+      suspended.push(id);
+    },
+  };
+  const tools = createAgentTools(ref);
+  const wait = tools.find((tool) => tool.name === "wait_for_peer")!;
+  const result = (await call(wait, { wait_id: "wait-1" })) as { terminate?: boolean };
+  assert.deepEqual(suspended, ["wait-1"]);
+  assert.equal(result.terminate, true);
+  assert.equal(ref.peerWaitId, "wait-1");
+  assert.equal(ref.silentRequested, true);
+  const blocked = (await call(
+    tools.find((tool) => tool.name === "execute")!,
+    { command: "echo must-not-run" },
+  )) as { content: { text: string }[]; terminate?: boolean };
+  assert.equal(blocked.terminate, true);
+  assert.match(blocked.content[0]!.text, /not executed/);
+});
+
+test("peer waiting drains existing tools and blocks new calls before suspension", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let suspended = false;
+  const ref: ToolContextRef = {
+    current: {
+      ...fakeToolContext(),
+      execute: async () => {
+        await held;
+        return { stdout: "done", stderr: "", code: 0, timedOut: false };
+      },
+    },
+    suspendPeerWait: async () => {
+      suspended = true;
+    },
+  };
+  const tools = createAgentTools(ref);
+  const executing = call(
+    tools.find((tool) => tool.name === "execute"),
+    { command: "work" },
+  );
+  const waiting = call(
+    tools.find((tool) => tool.name === "wait_for_peer"),
+    { wait_id: "wait-1" },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(suspended, false);
+  const blocked = (await call(
+    tools.find((tool) => tool.name === "write"),
+    { path: "blocked", data: "x" },
+  )) as { content: { text: string }[]; terminate?: boolean };
+  assert.match(blocked.content[0]!.text, /not executed/);
+  assert.equal(blocked.terminate, false);
+  release();
+  await executing;
+  await waiting;
+  assert.equal(suspended, true);
+});
+
+test("peer waiting failures do not mark the turn suspended", async () => {
+  const ref: ToolContextRef = {
+    current: fakeToolContext(),
+    suspendPeerWait: async () => {
+      throw new Error("not the registering turn");
+    },
+  };
+  const wait = createAgentTools(ref).find((tool) => tool.name === "wait_for_peer")!;
+  await assert.rejects(call(wait, { wait_id: "another-wait" }), /registering turn/);
+  assert.equal(ref.peerWaitId, undefined);
+  assert.equal(ref.silentRequested, undefined);
+});
+
 function fakeToolContext(sink?: { lastExecOpts?: Parameters<ToolContext["execute"]>[1] }): ToolContext {
   return {
     async execute(command, opts) {

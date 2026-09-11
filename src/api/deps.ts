@@ -1,6 +1,7 @@
 import type { BrokerSessionStore } from "../auth/broker-sessions.ts";
 import type { PeerIdentity } from "../coordination/identity.ts";
 import type { PeerBoard } from "../coordination/board.ts";
+import type { PeerWaits } from "../coordination/waits.ts";
 import type { PeerSpawning } from "../coordination/spawning.ts";
 import type { PeerLifecycle } from "../coordination/lifecycle.ts";
 import type { SandboxBackendName } from "../sandbox/sandbox-routing.ts";
@@ -131,6 +132,7 @@ export interface ServerDeps {
   sessions?: SessionStore;
   peerIdentity?: PeerIdentity;
   peerBoard?: PeerBoard;
+  peerWaits?: PeerWaits;
   peerSpawning?: PeerSpawning;
   peerLifecycle?: PeerLifecycle;
   peerExecution?: import("../coordination/execution.ts").PeerExecutionService;

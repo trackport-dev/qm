@@ -45,6 +45,8 @@ function describePublishAudience(a: PublishAudienceDescriptor | undefined): stri
 }
 
 export interface ToolContextRef {
+  suspendPeerWait?(id: string): Promise<void>;
+  peerWaitId?: string;
   onExecutionPending?(operation: Promise<void>): void;
   runtimeHandoff?: RuntimeHandoff;
   runtimeRunId?: string;
@@ -3140,6 +3142,29 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     },
   });
 
+  const waitForPeer = defineTool({
+    name: "wait_for_peer",
+    label: "Wait for peer replies",
+    description:
+      "Suspend this turn until a registered peer reply wait resolves or times out. First register the wait through POST /v1/peer-waits. This ends the turn and releases execution capacity; a durable continuation resumes the session. Human input and other actionable peer messages may run while the subscription remains active.",
+    parameters: Type.Object({ wait_id: Type.String({ minLength: 1 }) }),
+    async execute(callId, params) {
+      if (!ref.suspendPeerWait) throw new Error("peer coordination is unavailable for this turn");
+      await recordCall(callId, { tool: "wait_for_peer", waitId: params.wait_id });
+      await ref.suspendPeerWait(params.wait_id);
+      ref.peerWaitId = params.wait_id;
+      ref.silentRequested = true;
+      return recordResult(
+        callId,
+        { tool: "wait_for_peer", waitId: params.wait_id, suspended: true },
+        {
+          ...text("Reply wait recorded. Ending this turn; continuation will resume after replies or timeout."),
+          terminate: true,
+        },
+      );
+    },
+  });
+
   const finishSilently = defineTool({
     name: "finish_silently",
     label: "finish_silently",
@@ -3624,6 +3649,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     getGoal,
     updateGoal,
     runtime,
+    waitForPeer,
     ...mcpTools,
   ];
   const mcpNames = new Set(mcpTools.map((t) => t.name));
@@ -3727,25 +3753,34 @@ function withRuntimeBarrier(tool: ToolDefinition, ref: ToolContextRef): ToolDefi
     ...tool,
     async execute(...args) {
       const [, params] = args;
+      if (ref.peerWaitId)
+        return {
+          content: [
+            { type: "text" as const, text: "This turn is suspended for peer replies; the call was not executed." },
+          ],
+          details: {},
+          terminate: true,
+        };
       if (ref.runtimeHandoff || ref.runtimeMutationPending)
         return {
           content: [
             {
               type: "text" as const,
-              text: "Runtime handoff in progress; this call was not executed. Resume unfinished work on the selected runtime.",
+              text: "Turn transition in progress; this call was not executed. Resume unfinished work after the transition.",
             },
           ],
           details: {},
           terminate: !!ref.runtimeHandoff,
         };
-      const mutation = tool.name === "runtime" && (!isObj(params) || params.action !== "get");
+      const mutation =
+        tool.name === "wait_for_peer" || (tool.name === "runtime" && (!isObj(params) || params.action !== "get"));
       if (mutation) {
         ref.runtimeMutationPending = true;
         try {
           await Promise.allSettled(ref.runtimeInFlight ?? []);
           if (ref.abortSignal?.aborted || ref.pausedOnApproval || ref.silentRequested)
             return {
-              content: [{ type: "text" as const, text: "Runtime change cancelled before execution." }],
+              content: [{ type: "text" as const, text: "Turn transition cancelled before execution." }],
               details: {},
               terminate: true,
             };

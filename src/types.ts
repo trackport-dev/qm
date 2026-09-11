@@ -562,6 +562,7 @@ export interface OverheardMessage {
 }
 
 export interface PeerOrigin {
+  continuation?: { kind: "reply_wait"; waitId: string };
   kind: "peer";
   messageId: string;
   senderSessionId: string;

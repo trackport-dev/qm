@@ -12,6 +12,7 @@ interface Candidate {
   character: Record<string, unknown>;
 }
 interface Message {
+  continuation?: { kind: "reply_wait"; waitId: string };
   id: string;
   senderId: string;
   senderName: string;
@@ -40,6 +41,25 @@ interface Detail {
 interface Page {
   messages: Message[];
   nextCursor: number;
+  hasMore: boolean;
+}
+interface ReplyWait {
+  id: string;
+  sessionId: string;
+  messageId: string;
+  mode: "first" | "all";
+  recipientIds: string[];
+  replyIds: string[];
+  state: string;
+  outcome: "ready" | "timed_out" | null;
+  createdAt: number;
+  deadline: number;
+  suspendedAt: number | null;
+  resumeMessageId: string | null;
+}
+interface WaitPage {
+  waits: ReplyWait[];
+  nextCursor: string;
   hasMore: boolean;
 }
 interface Preview {
@@ -89,6 +109,10 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
   let connectionNotice = "";
   let selected = parseDeepLink(UI_BASE, location.pathname, location.search).item;
   let detail: Detail | null = null;
+  let replyWaits: ReplyWait[] = [];
+  let waitPages = 1;
+  let moreWaits = false;
+  let detailRequest = 0;
   let expression = '.[] | select(.group == "new-feature" and .role == "worker")';
   let preview: Preview | null = null;
   let treeRoot = "";
@@ -175,6 +199,9 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
   async function select(id: string): Promise<void> {
     selected = id;
     detail = null;
+    replyWaits = [];
+    waitPages = 1;
+    moreWaits = false;
     history.replaceState(history.state, "", permalink(id));
     paint();
     await loadDetail();
@@ -182,13 +209,66 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
   async function loadDetail(): Promise<void> {
     const id = selected;
     if (!id) return;
+    const version = ++detailRequest;
     try {
       const result = await request<Detail>(`/api/peer-messages/${encodeURIComponent(id)}`);
-      if (selected === id && active()) detail = result;
+      const waits = new Map<string, ReplyWait>();
+      let after = "";
+      let hasMore = false;
+      for (let page = 0; page < waitPages; page++) {
+        const query = new URLSearchParams({ messageId: id, after, limit: "50" });
+        const result = await request<WaitPage>(`/api/peer-waits?${query}`);
+        for (const wait of result.waits) waits.set(wait.id, wait);
+        after = result.nextCursor;
+        hasMore = result.hasMore;
+        if (!hasMore) break;
+      }
+      if (result.message.continuation) {
+        const { wait } = await request<{ wait: ReplyWait }>(
+          `/api/peer-waits/${encodeURIComponent(result.message.continuation.waitId)}`,
+        );
+        waits.set(wait.id, wait);
+      }
+      if (selected === id && active() && version === detailRequest) {
+        detail = result;
+        replyWaits = [...waits.values()];
+        moreWaits = hasMore;
+      }
     } catch (error) {
-      if (selected === id) notice = errMessage(error);
+      if (selected === id && version === detailRequest) notice = errMessage(error);
     }
     paint();
+  }
+  function waitCard(wait: ReplyWait): ReturnType<typeof html> {
+    return html`<article class="board-delivery" id=${`wait-${wait.id}`}>
+      <strong>Reply wait · ${wait.state.replaceAll("_", " ")}</strong>
+      <p>${wait.id}</p>
+      <p>
+        Mode: ${wait.mode === "first" ? "First selected recipient to reply" : "One reply from every selected recipient"}
+      </p>
+      <p>Outcome: ${wait.outcome ? wait.outcome.replaceAll("_", " ") : "Pending"}</p>
+      <p>Created ${stamp(wait.createdAt)} · Deadline ${stamp(wait.deadline)}</p>
+      <p>
+        ${wait.suspendedAt === null ? "Registered; turn has not suspended for this wait." : `Turn suspension recorded ${stamp(wait.suspendedAt)}.`}
+      </p>
+      <p>Frozen recipients: ${wait.recipientIds.join(", ") || "None — no replies required"}</p>
+      <button class="btn" @click=${() => void select(wait.messageId)}>Inspect original request</button>
+      <p>Selected replies: ${wait.replyIds.length}</p>
+      ${wait.replyIds.map((id) => html`<button class="btn" @click=${() => void select(id)}>Inspect reply ${id}</button>`)}
+      ${
+        wait.resumeMessageId
+          ? html`<p>
+                Continuation
+                ${wait.state === "resumed" ? "consumed by the recipient" : "published; inspect delivery for progress"}.
+              </p>
+              <button class="btn" @click=${() => void select(wait.resumeMessageId!)}>Inspect continuation</button>`
+          : wait.suspendedAt !== null && wait.outcome
+            ? html`<p>
+                Continuation not yet published. Source execution release and agent lifecycle gates still apply.
+              </p>`
+            : nothing
+      }
+    </article>`;
   }
   async function refresh(reset = false): Promise<void> {
     if (!active()) return;
@@ -342,6 +422,7 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
                       >${message.senderName} · ${stamp(message.createdAt)}</a
                     >
                     <p class="board-text">${message.text}</p>
+                    ${message.continuation ? html`<p><strong>System-generated reply-wait continuation</strong> · ${message.continuation.waitId}</p>` : nothing}
                     <small
                       >${message.recipientIds.length ? `${message.recipientIds.length} intended recipients` : "No recipients — published without notification"}${message.replyTo ? " · Reply" : ""}</small
                     >
@@ -359,6 +440,14 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
                     <h2>Message inspector</h2>
                     <a href=${permalink(detail.message.id)}>Permalink</a>
                     <p>Sender: ${detail.message.senderName} (${detail.message.senderId})</p>
+                    ${
+                      detail.message.continuation
+                        ? html`<p>
+                              <strong>System-generated reply-wait continuation</strong> — not an agent-authored reply.
+                            </p>
+                            <a href=${`#wait-${detail.message.continuation.waitId}`}>Inspect originating wait</a>`
+                        : nothing
+                    }
                     <button class="btn" @click=${() => void loadTree(detail!.message.senderId)}>
                       Inspect sender subtree
                     </button>
@@ -392,6 +481,25 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
                           <small>Created ${stamp(delivery.createdAt)} · Updated ${stamp(delivery.updatedAt)}</small>
                         </article>`,
                     )}
+                    <h3>Reply waits</h3>
+                    <p>
+                      Reading these diagnostics does not wake agents. Suspension, continuation delivery, and reply
+                      completion are separate states.
+                    </p>
+                    ${replyWaits.length ? replyWaits.map(waitCard) : html`<p>No reply waits registered.</p>`}
+                    ${
+                      moreWaits
+                        ? html`<button
+                            class="btn"
+                            @click=${() => {
+                              waitPages++;
+                              void loadDetail();
+                            }}
+                          >
+                            Load more waits
+                          </button>`
+                        : nothing
+                    }
                   `
                 : html`<p>
                     ${selected ? "Loading message…" : "Select a message to inspect its audience and delivery."}

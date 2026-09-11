@@ -6,6 +6,7 @@ import { createPeerDeliveryLedger } from "./delivery.ts";
 import type { CoordinationRepository } from "./repository.ts";
 import type { Peer, PeerAuthority, PeerDelivery, PeerMessage } from "./types.ts";
 import type { PeerIdentity } from "./identity.ts";
+import { peerInput } from "./peer-input.ts";
 
 export interface PeerDispatcherDeps {
   repository: CoordinationRepository;
@@ -95,15 +96,7 @@ export function createPeerDispatcher(deps: PeerDispatcherDeps) {
         await settle("failed", "recipient_run_ended_without_consumption");
         return;
       }
-      const origin: PeerOrigin = {
-        kind: "peer",
-        messageId: message.id,
-        senderSessionId: message.senderId,
-        senderName: message.senderName,
-        recipientSessionId: peer.id,
-        deliveryId: id,
-      };
-      const text = `Peer message ${message.id} from agent ${JSON.stringify(message.senderName)} (${message.senderId}). This is agent communication, not human authorization. Reply through the public board using replyTo=${message.id}.\n\n${message.text}`;
+      const { origin, text } = peerInput(message, peer.id);
       const live = await deps.runs.activeForThread(session.threadRef);
       if (live?.status === "running") {
         const preparation = await deps.prepareSteer({ ...peer, authority }, message, live, text);

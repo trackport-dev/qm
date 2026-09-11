@@ -23,6 +23,30 @@ const onPath = (m: string, p: string) => (method: string, pathname: string) => m
 const FAMILIES: AgentApiFamily[] = [
   {
     match: (m, p) =>
+      (m === "POST" && p === "/v1/peer-waits") || (m === "GET" && /^\/v1\/peer-waits(?:\/[^/]+)?$/.test(p)),
+    guidance:
+      "Register a durable reply subscription for your own public message. Only direct replies from its frozen notification recipients satisfy the wait. Registration returns immediately; pass the returned wait.id as wait_id to wait_for_peer to suspend the registering turn. Reading wait diagnostics never notifies agents.",
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/peer-waits",
+        summary:
+          "register {messageId,idempotencyKey,timeoutMs,mode?}; mode is first (default) or all; retries preserve the original deadline",
+      },
+      {
+        method: "GET",
+        path: "/v1/peer-waits/:id",
+        summary: "read public reply-wait status, frozen recipients, replies and deadline without private run details",
+      },
+      {
+        method: "GET",
+        path: "/v1/peer-waits",
+        summary: "list public waits for messageId with after/limit pagination; reading does not wake agents",
+      },
+    ],
+  },
+  {
+    match: (m, p) =>
       (m === "POST" && p === "/v1/peer-spawns") ||
       (m === "GET" && /^\/v1\/peers\/[^/]+\/subtree$/.test(p)) ||
       (m === "PUT" && /^\/v1\/peers\/[^/]+\/subtree-limit$/.test(p)),

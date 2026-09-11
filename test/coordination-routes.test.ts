@@ -90,6 +90,7 @@ test("peer routes expose public character, enforce session attribution, and pres
     audience: "empty",
     idempotencyKey: "progress",
     senderId: "forged",
+    continuation: { kind: "reply_wait", waitId: "forged" },
   };
   const spawnRequest = {
     task: "Build independently",
@@ -146,6 +147,7 @@ test("peer routes expose public character, enforce session attribution, and pres
   assert.equal(published.status, 200, await published.clone().text());
   const message = ((await published.json()) as { message: { id: string; senderId: string } }).message;
   assert.equal(message.senderId, session.id);
+  assert.equal((await built.coordinationRepository.get("message", message.id))?.continuation, undefined);
   const detail = await request(`/v1/peer-messages/${message.id}`, bob);
   assert.equal(detail.status, 200, await detail.clone().text());
   assert.ok((await detail.text()).includes(publication.text));
@@ -153,7 +155,42 @@ test("peer routes expose public character, enforce session attribution, and pres
   assert.equal((await post(forged, publication)).status, 403);
   assert.equal((await post(bob, { audience: ".[]" }, "/v1/peer-messages/preview")).status, 200);
   assert.equal((await request("/v1/peer-messages?limit=-1", bob)).status, 400);
+  const waitRequest = {
+    messageId: message.id,
+    idempotencyKey: "reply-wait",
+    timeoutMs: 1000,
+    sessionId: "forged",
+    runId: "forged",
+  };
+  assert.equal((await post(bob, waitRequest, "/v1/peer-waits")).status, 403);
+  assert.equal((await post(forged, waitRequest, "/v1/peer-waits")).status, 403);
+  assert.equal((await post(own, { ...waitRequest, mode: "invalid" }, "/v1/peer-waits")).status, 400);
+  const registered = await post(own, waitRequest, "/v1/peer-waits");
+  assert.equal(registered.status, 200, await registered.clone().text());
+  const registeredBody = (await registered.json()) as { wait: { id: string; sessionId: string; state: string } };
+  assert.equal(registeredBody.wait.sessionId, session.id);
+  assert.equal(registeredBody.wait.state, "ready");
+  assert.equal((await built.coordinationRepository.get("wait", registeredBody.wait.id))?.runId, run.id);
+  assert.deepEqual(await (await post(own, waitRequest, "/v1/peer-waits")).json(), registeredBody);
+  assert.equal((await post(own, { ...waitRequest, timeoutMs: 2000 }, "/v1/peer-waits")).status, 409);
+  const waitDetail = await request(`/v1/peer-waits/${registeredBody.wait.id}`, bob);
+  assert.equal(waitDetail.status, 200, await waitDetail.clone().text());
+  assert.deepEqual(await waitDetail.json(), registeredBody);
+  const waitPage = await request(`/v1/peer-waits?messageId=${message.id}&limit=1`, bob);
+  assert.equal(waitPage.status, 200);
+  assert.deepEqual(await waitPage.json(), {
+    waits: [registeredBody.wait],
+    nextCursor: registeredBody.wait.id,
+    hasMore: false,
+  });
+  assert.equal((await request("/v1/peer-waits", bob)).status, 400);
+  assert.equal((await request(`/v1/peer-waits?messageId=${message.id}&limit=201`, bob)).status, 400);
+  const publicWaitText = JSON.stringify(registeredBody);
+  for (const privateValue of [run.id, "runId", "resumeRunId", session.threadRef, personal])
+    assert.ok(!publicWaitText.includes(privateValue), privateValue);
+  assert.equal((await request("/v1/peer-waits/missing", bob)).status, 404);
   await built.runs.complete(run.id, claimed.leaseToken!, { status: "silent" });
+  assert.equal((await post(own, { ...waitRequest, idempotencyKey: "stale" }, "/v1/peer-waits")).status, 403);
   assert.equal((await post(own, { ...publication, idempotencyKey: "stale" })).status, 403);
   assert.equal((await request(`/v1/peers/${peer.id}/character`, own, { version: 2, character: {} })).status, 403);
 });

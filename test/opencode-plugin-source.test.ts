@@ -66,8 +66,14 @@ test("OpenCode observes cancellation before runtime startup, session creation, a
     harnessSource.indexOf("const runPrompt ="),
     harnessSource.indexOf("const single ="),
   );
-  const guards = [...runPrompt.matchAll(/if \(turn\.cancel\?\.aborted\)/g)].map((match) => match.index ?? -1);
-  const prompt = runPrompt.indexOf("rt.client.session.prompt({");
-  assert.ok(guards.length >= 3);
+  assert.ok(runPrompt.indexOf("if (turn.cancel?.aborted)") < runPrompt.indexOf("await ensureRuntime()"));
+  const runInRuntime = harnessSource.slice(
+    harnessSource.indexOf("const runInRuntime ="),
+    harnessSource.indexOf("const runPrompt ="),
+  );
+  const guards = [...runInRuntime.matchAll(/if \(turn\.cancel\?\.aborted\)/g)].map((match) => match.index ?? -1);
+  const prompt = runInRuntime.indexOf("rt.client.session.prompt({");
+  assert.ok(guards.length >= 2);
+  assert.ok(guards[0]! < runInRuntime.indexOf("rt.client.session.create("));
   assert.ok(guards.every((index) => index < prompt));
 });

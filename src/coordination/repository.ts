@@ -7,6 +7,7 @@ import type {
   PeerDelivery,
   PeerMessage,
   PeerSpawn,
+  PeerWait,
 } from "./types.ts";
 
 export interface PeerMessageQuery {
@@ -28,6 +29,17 @@ export interface PeerMessagePage {
 }
 
 export interface CoordinationRead {
+  waitPage(
+    messageId: string,
+    after: string,
+    limit: number,
+  ): Promise<{ waits: PeerWait[]; nextCursor: string; hasMore: boolean }>;
+  pendingWaitIds(after: string, limit: number): Promise<string[]>;
+  firstReplies(
+    messageId: string,
+    recipientIds: string[],
+    deadline: number,
+  ): Promise<{ id: string; senderId: string }[]>;
   livePeerIds(after: string, limit: number): Promise<string[]>;
   get<K extends CoordinationKind>(kind: K, id: string): Promise<CoordinationRows[K] | null>;
   list<K extends CoordinationKind>(kind: K, filter?: Partial<CoordinationRows[K]>): Promise<CoordinationRows[K][]>;
@@ -65,6 +77,42 @@ export function createMemoryCoordinationRepository(): CoordinationRepository {
   let events: CoordinationEvent[] = [];
   const queue = createKeyedQueue();
   const read = (data: MemoryRows, log: CoordinationEvent[]): CoordinationRead => ({
+    async waitPage(messageId, after, limit) {
+      eventWindow(0, limit);
+      const rows = [...data.wait.values()]
+        .filter((wait) => wait.messageId === messageId && Buffer.compare(Buffer.from(wait.id), Buffer.from(after)) > 0)
+        .sort((a, b) => Buffer.compare(Buffer.from(a.id), Buffer.from(b.id)))
+        .slice(0, limit + 1);
+      const waits = rows.slice(0, limit);
+      return structuredClone({ waits, nextCursor: waits.at(-1)?.id ?? after, hasMore: rows.length > limit });
+    },
+    async pendingWaitIds(after, limit) {
+      eventWindow(0, limit);
+      return [...data.wait.values()]
+        .filter(
+          (wait) =>
+            (wait.state === "waiting" ||
+              ((wait.state === "ready" || wait.state === "timed_out") && wait.suspendedAt !== null)) &&
+            Buffer.compare(Buffer.from(wait.id), Buffer.from(after)) > 0,
+        )
+        .map((wait) => wait.id)
+        .sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+        .slice(0, limit);
+    },
+    async firstReplies(messageId, recipientIds, deadline) {
+      const recipients = new Set(recipientIds);
+      const selected = new Map<string, { id: string; senderId: string }>();
+      for (const reply of [...data.message.values()].sort((a, b) => a.sequence - b.sequence)) {
+        if (
+          reply.replyTo === messageId &&
+          recipients.has(reply.senderId) &&
+          reply.createdAt <= deadline &&
+          !selected.has(reply.senderId)
+        )
+          selected.set(reply.senderId, { id: reply.id, senderId: reply.senderId });
+      }
+      return [...selected.values()];
+    },
     async livePeerIds(after, limit) {
       eventWindow(0, limit);
       return [...data.peer.values()]
@@ -152,6 +200,10 @@ export function createMemoryCoordinationRepository(): CoordinationRepository {
     },
   });
   return {
+    waitPage: (messageId, after, limit) => read(rows, events).waitPage(messageId, after, limit),
+    pendingWaitIds: (after, limit) => read(rows, events).pendingWaitIds(after, limit),
+    firstReplies: (messageId, recipientIds, deadline) =>
+      read(rows, events).firstReplies(messageId, recipientIds, deadline),
     get: (kind, id) => read(rows, events).get(kind, id),
     list: (kind, filter) => read(rows, events).list(kind, filter),
     events: (after, limit) => read(rows, events).events(after, limit),
@@ -244,6 +296,30 @@ export function createPostgresCoordinationRepository(
     ],
   };
   pg.registerMigration(peerPageMigration);
+  const replyIndexMigration = {
+    id: "coordination/0009-reply-lookup",
+    statements: [
+      `CREATE INDEX IF NOT EXISTS coordination_reply_lookup ON coordination_records
+      (org_id, (json->>'replyTo'), (json->>'senderId'), ((json->>'sequence')::bigint))
+      WHERE kind='message'`,
+    ],
+  };
+  pg.registerMigration(replyIndexMigration);
+  const waitIndexMigration = {
+    id: "coordination/0010-pending-waits",
+    statements: [
+      `CREATE INDEX IF NOT EXISTS coordination_pending_waits ON coordination_records (org_id, id COLLATE "C")
+      WHERE kind='wait' AND (json->>'state'='waiting' OR (json->>'state' IN ('ready','timed_out') AND json->>'suspendedAt' IS NOT NULL))`,
+    ],
+  };
+  pg.registerMigration(waitIndexMigration);
+  const waitMessageIndexMigration = {
+    id: "coordination/0013-message-waits",
+    statements: [
+      "CREATE INDEX IF NOT EXISTS coordination_message_waits ON coordination_records (org_id, (json->>'messageId'), id COLLATE \"C\") WHERE kind='wait'",
+    ],
+  };
+  pg.registerMigration(waitMessageIndexMigration);
   let initializing: Promise<void> | undefined;
   const ready = () =>
     (initializing ??= pg
@@ -252,6 +328,9 @@ export function createPostgresCoordinationRepository(
       .then(() => pg.migrate(messageIndexMigration))
       .then(() => pg.migrate(spawnIndexMigration))
       .then(() => pg.migrate(peerPageMigration))
+      .then(() => pg.migrate(replyIndexMigration))
+      .then(() => pg.migrate(waitIndexMigration))
+      .then(() => pg.migrate(waitMessageIndexMigration))
       .catch((error) => {
         initializing = undefined;
         throw error;
@@ -263,6 +342,39 @@ export function createPostgresCoordinationRepository(
       return pg.q(sql, values);
     };
     return {
+      async waitPage(messageId, after, limit) {
+        eventWindow(0, limit);
+        const rows = await query(
+          `SELECT json FROM coordination_records WHERE org_id=$1 AND kind='wait' AND json->>'messageId'=$2 AND id COLLATE "C">$3 COLLATE "C" ORDER BY id COLLATE "C" LIMIT $4`,
+          [orgId, messageId, after, limit + 1],
+        );
+        const waits = rows.slice(0, limit).map((row) => row.json as PeerWait);
+        return { waits, nextCursor: waits.at(-1)?.id ?? after, hasMore: rows.length > limit };
+      },
+      async pendingWaitIds(after, limit) {
+        eventWindow(0, limit);
+        const rows = await query(
+          `SELECT id FROM coordination_records WHERE org_id=$1 AND kind='wait'
+          AND (json->>'state'='waiting' OR (json->>'state' IN ('ready','timed_out') AND json->>'suspendedAt' IS NOT NULL))
+          AND id COLLATE "C">$2 COLLATE "C" ORDER BY id COLLATE "C" LIMIT $3`,
+          [orgId, after, limit],
+        );
+        return rows.map((row) => row.id as string);
+      },
+      async firstReplies(messageId, recipientIds, deadline) {
+        const result = await query(
+          `SELECT reply.id, recipient.sender AS "senderId" FROM
+          (SELECT DISTINCT unnest($3::text[]) AS sender) recipient
+          CROSS JOIN LATERAL (
+            SELECT id, (json->>'sequence')::bigint AS sequence FROM coordination_records
+            WHERE org_id=$1 AND kind='message' AND json->>'replyTo'=$2
+            AND json->>'senderId'=recipient.sender AND (json->>'createdAt')::bigint<=$4
+            ORDER BY (json->>'sequence')::bigint LIMIT 1
+          ) reply ORDER BY reply.sequence`,
+          [orgId, messageId, recipientIds, deadline],
+        );
+        return result.map((row) => ({ id: row.id as string, senderId: row.senderId as string }));
+      },
       async livePeerIds(after, limit) {
         eventWindow(0, limit);
         const rows = await query(

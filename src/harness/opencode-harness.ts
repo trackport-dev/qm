@@ -41,6 +41,7 @@ import { countTokens } from "../util/tokens.ts";
 
 const OPENCODE_VERSION = "1.17.18";
 const OPENCODE_IDLE_WAIT_MS = 30 * 60_000;
+const OPENCODE_CONTROL_TIMEOUT_MS = 5_000;
 export const OPENCODE_STARTUP_TIMEOUT_MS = 90_000;
 
 export interface OpenCodeHarnessOptions extends HarnessToolPlumbing {
@@ -100,6 +101,9 @@ type ActiveTurn = {
 };
 
 type Runtime = {
+  retiring: boolean;
+  users: number;
+  exited: Promise<void>;
   client: OpencodeClient;
   process: ChildProcess;
   bridge: ReturnType<typeof createServer>;
@@ -338,10 +342,11 @@ async function freePort(): Promise<number> {
   return address.port;
 }
 
-async function waitForSessionIdle(client: OpencodeClient, sessionId: string, timeoutMs: number): Promise<void> {
+export async function waitForSessionIdle(client: OpencodeClient, sessionId: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const response = await client.session.status();
+    const response = await client.session.status({ signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS) });
+    if (response.error || !response.data) throw new Error("OpenCode session status could not be verified");
     const status = response.data?.[sessionId] as { type?: string } | undefined;
     if (!status || status.type === "idle") return;
     await sleep(100);
@@ -398,7 +403,10 @@ function usageFromInfo(info: AssistantMessageInfo | undefined): LlmCallUsage | n
 }
 
 export async function latestAssistantParts(client: OpencodeClient, sessionId: string): Promise<unknown[] | null> {
-  const response = await client.session.messages({ path: { id: sessionId } });
+  const response = await client.session.messages({
+    path: { id: sessionId },
+    signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS),
+  });
   const messages = response.data ?? [];
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index] as { info?: AssistantMessageInfo; parts?: unknown[] };
@@ -562,7 +570,9 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             const requestedSessionId = decodeURIComponent(sessionMatch[1]!);
             let state = active.get(requestedSessionId);
             if (!state && runtime) {
-              const session = await runtime.client.session.get({ path: { id: requestedSessionId } }).catch(() => null);
+              const session = await runtime.client.session
+                .get({ path: { id: requestedSessionId }, signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS) })
+                .catch(() => null);
               const parentId = session?.data?.parentID;
               const parent = parentId ? active.get(parentId) : undefined;
               if (parent) {
@@ -778,6 +788,9 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
           }
         })();
         const created: Runtime = {
+          retiring: false,
+          users: 0,
+          exited: new Promise<void>((resolveExit) => proc!.once("exit", () => resolveExit())),
           client,
           process: proc,
           bridge,
@@ -813,19 +826,28 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     }
   };
 
-  const runPrompt = async (turn: HarnessTurnInput): Promise<HarnessTurnResult> => {
+  const runInRuntime = async (turn: HarnessTurnInput, rt: Runtime): Promise<HarnessTurnResult> => {
     if (turn.cancel?.aborted) return { reply: "", stopped: true };
-    const rt = await ensureRuntime();
-    if (turn.cancel?.aborted) return { reply: "", stopped: true };
+    const retire = () => {
+      rt.retiring = true;
+      return rt.exited;
+    };
     const selectedModel = turn.runtime?.modelId ?? resolveModelId(turn.scopeLabel);
     const model = modelRef(selectedModel);
-    const created = await rt.client.session.create({ body: { title: `qm:${turn.session.id}` } });
+    const created = await rt.client.session.create({
+      body: { title: `qm:${turn.session.id}` },
+      signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS),
+    });
     const session = created.data;
     if (!session) throw new Error(`OpenCode session creation failed: ${JSON.stringify(created.error)}`);
     const sessionId = session.id;
     if (turn.cancel?.aborted) {
-      await rt.client.session.abort({ path: { id: sessionId } }).catch(() => undefined);
-      await rt.client.session.delete({ path: { id: sessionId } }).catch(() => undefined);
+      await rt.client.session
+        .abort({ path: { id: sessionId }, signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS) })
+        .catch(() => undefined);
+      await rt.client.session
+        .delete({ path: { id: sessionId }, signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS) })
+        .catch(() => undefined);
       return { reply: "", stopped: true };
     }
     const ref = harnessToolContext(turn);
@@ -864,7 +886,11 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     const abort = async (stopped: boolean) => {
       state.stopped ||= stopped;
       controller.abort();
-      await rt.client.session.abort({ path: { id: sessionId } }).catch(() => undefined);
+      const terminated = retire();
+      turn.onExecutionPending?.(terminated);
+      await rt.client.session
+        .abort({ path: { id: sessionId }, signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS) })
+        .catch(() => undefined);
     };
     const onCancel = () => {
       void abort(false);
@@ -877,21 +903,29 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       await abort(false);
       active.delete(sessionId);
       turn.cancel.removeEventListener("abort", onCancel);
-      await rt.client.session.delete({ path: { id: sessionId } }).catch(() => undefined);
+      await rt.client.session
+        .delete({ path: { id: sessionId }, signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS) })
+        .catch(() => undefined);
       return { reply: "", stopped: true };
     }
     const wallMs = turn.turnWallClockMs ?? defaultTurnWallClockMs;
     const queuedSignals = new Set<Promise<void>>();
     const queueSignal = (text: string, peerOrigin?: import("../types.ts").PeerOrigin): Promise<void> => {
+      const terminated = retire();
+      turn.onExecutionPending?.(terminated);
       const pending = (async () => {
         const submitted = await rt.client.session.promptAsync({
+          signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS),
           path: { id: sessionId },
           body: { model, agent: "qm", parts: [{ type: "text", text }] },
         });
         if (submitted.error) throw new Error("OpenCode rejected steering input");
         await waitForSessionIdle(rt.client, sessionId, wallMs > 0 ? wallMs : OPENCODE_IDLE_WAIT_MS);
         if (peerOrigin && !state.stopped && !turn.cancel?.aborted) {
-          const listed = await rt.client.session.messages({ path: { id: sessionId } });
+          const listed = await rt.client.session.messages({
+            path: { id: sessionId },
+            signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS),
+          });
           const messages = listed.data ?? [];
           const inputs = new Set(
             messages
@@ -946,7 +980,9 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       const infoByCapture = new Map<LlmCapture, AssistantMessageInfo>();
       await Promise.all(
         [...capturesBySession.entries()].map(async ([id, group]) => {
-          const listed = await rt.client.session.messages({ path: { id } }).catch(() => null);
+          const listed = await rt.client.session
+            .messages({ path: { id }, signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS) })
+            .catch(() => null);
           const infos = (listed?.data ?? [])
             .map((message) => (message as { info?: AssistantMessageInfo }).info)
             .filter((info): info is AssistantMessageInfo => info?.role === "assistant");
@@ -1003,7 +1039,11 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
         path: { id: sessionId },
         body: { model, agent: "qm", system: turn.systemPrompt, tools: enabled, parts: promptParts as never },
       });
-      turn.onExecutionPending?.(request.then(() => {}));
+      const execution = request.then(
+        (response) => (response.data ? undefined : retire()),
+        () => retire(),
+      );
+      turn.onExecutionPending?.(execution);
       const response =
         wallMs > 0
           ? await Promise.race([
@@ -1025,7 +1065,10 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       const parts = hadQueuedSignals
         ? ((await latestAssistantParts(rt.client, sessionId)) ?? (response.data.parts as unknown[]))
         : (response.data.parts as unknown[]);
-      const messages = await rt.client.session.messages({ path: { id: sessionId } });
+      const messages = await rt.client.session.messages({
+        path: { id: sessionId },
+        signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS),
+      });
       for (const message of messages.data ?? []) {
         for (const part of (message as { parts?: unknown[] }).parts ?? []) {
           await processEvent({ payload: { type: "message.part.updated", properties: { part } } });
@@ -1093,7 +1136,34 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       }
       await flushLlmRequests();
       for (const [id, candidate] of active) if (candidate.turn === turn) active.delete(id);
-      await rt.client.session.delete({ path: { id: sessionId } }).catch(() => undefined);
+      await rt.client.session
+        .delete({ path: { id: sessionId }, signal: AbortSignal.timeout(OPENCODE_CONTROL_TIMEOUT_MS) })
+        .catch(() => undefined);
+    }
+  };
+
+  const runPrompt = async (turn: HarnessTurnInput): Promise<HarnessTurnResult> => {
+    if (turn.cancel?.aborted) return { reply: "", stopped: true };
+    let rt = await ensureRuntime();
+    while (rt.retiring) {
+      if (turn.cancel?.aborted) return { reply: "", stopped: true };
+      const cancelled = Promise.withResolvers<void>();
+      const onCancel = () => cancelled.resolve();
+      turn.cancel?.addEventListener("abort", onCancel, { once: true });
+      try {
+        await Promise.race([rt.exited, cancelled.promise]);
+      } finally {
+        turn.cancel?.removeEventListener("abort", onCancel);
+      }
+      if (turn.cancel?.aborted) return { reply: "", stopped: true };
+      rt = await ensureRuntime();
+    }
+    rt.users++;
+    try {
+      return await runInRuntime(turn, rt);
+    } finally {
+      rt.users--;
+      if (rt.retiring && rt.users === 0) await rt.close();
     }
   };
 

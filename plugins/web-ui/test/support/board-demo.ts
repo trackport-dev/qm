@@ -50,11 +50,59 @@ const messages = [
     createdAt: now - 30_000,
   },
 ];
-const request: typeof api = async <T>(path: string): Promise<T> => {
+const continuation = {
+  ...messages[0]!,
+  id: "continuation",
+  sequence: 4,
+  replyTo: null,
+  threadId: "continuation",
+  recipientIds: ["planner"],
+  createdAt: now - 20_000,
+  continuation: { kind: "reply_wait", waitId: "completed-wait" },
+  text: "The selected recipient replied. Resume the suspended work using the linked public reply.",
+};
+const timeline = [...messages, continuation];
+export const request: typeof api = async <T>(path: string): Promise<T> => {
   const url = new URL(path, location.origin);
+  const waits = [
+    {
+      id: "completed-wait",
+      sessionId: "planner",
+      messageId: "request",
+      mode: "first",
+      recipientIds: ["worker"],
+      replyIds: ["reply"],
+      state: "resumed",
+      outcome: "ready",
+      createdAt: now - 115_000,
+      deadline: now + 180_000,
+      suspendedAt: now - 110_000,
+      resumeMessageId: "continuation",
+    },
+    {
+      id: "timeout-wait",
+      sessionId: "planner",
+      messageId: "request",
+      mode: "all",
+      recipientIds: ["worker"],
+      replyIds: [],
+      state: "timed_out",
+      outcome: "timed_out",
+      createdAt: now - 110_000,
+      deadline: now - 65_000,
+      suspendedAt: now - 100_000,
+      resumeMessageId: null,
+    },
+  ];
+  if (url.pathname === "/api/peer-waits") {
+    const rows = waits.filter((wait) => wait.messageId === url.searchParams.get("messageId"));
+    return { waits: rows, nextCursor: rows.at(-1)?.id ?? "", hasMore: false } as T;
+  }
+  if (url.pathname.startsWith("/api/peer-waits/"))
+    return { wait: waits.find((wait) => wait.id === url.pathname.split("/").at(-1)) } as T;
   if (url.pathname.endsWith("/preview")) return { candidates, recipientIds: ["worker"] } as T;
   if (url.pathname === "/api/peer-messages") {
-    const rows = messages.filter(
+    const rows = timeline.filter(
       (message) =>
         message.sequence > Number(url.searchParams.get("after") ?? 0) &&
         (!url.searchParams.get("text") ||
@@ -67,16 +115,16 @@ const request: typeof api = async <T>(path: string): Promise<T> => {
       hasMore: false,
     } as T;
   }
-  const message = messages.find((item) => item.id === url.pathname.split("/").at(-1));
+  const message = timeline.find((item) => item.id === url.pathname.split("/").at(-1));
   if (!message) throw new Error("fixture message not found");
   return {
     message,
     deliveries: message.recipientIds.map((recipientId) => ({
       id: `${message.id}:${recipientId}`,
       recipientId,
-      state: message.id === "request" ? "consumed" : "blocked",
+      state: message.id === "request" || message.id === "continuation" ? "consumed" : "blocked",
       attempts: 2,
-      reason: message.id === "request" ? null : "recipient_awaiting_approval",
+      reason: message.id === "request" || message.id === "continuation" ? null : "recipient_awaiting_approval",
       createdAt: message.createdAt,
       updatedAt: now - 10_000,
     })),

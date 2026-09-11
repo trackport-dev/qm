@@ -1091,6 +1091,25 @@ const apiRoutes: readonly WebRoute[] = [
   },
   {
     method: "GET",
+    path: "/api/peer-waits",
+    handle: async (c) => {
+      const query = new URLSearchParams(c.url.searchParams);
+      query.set("principalId", c.user);
+      return relayCore(c.res, "GET", `/v1/peer-waits?${query}`);
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/peer-waits/:id",
+    handle: async (c) =>
+      relayCore(
+        c.res,
+        "GET",
+        `/v1/peer-waits/${encodeURIComponent(c.params.id!)}?principalId=${encodeURIComponent(c.user)}`,
+      ),
+  },
+  {
+    method: "GET",
     path: "/api/peer-messages/:id",
     handle: async (c) =>
       relayCore(

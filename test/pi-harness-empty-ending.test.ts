@@ -49,6 +49,10 @@ test("explicit finish_silently is intentional silence, never nudged", () => {
   assert.equal(emptyEndingNote(base({ ref: { modelCalls: 48, silentRequested: true } })), null);
 });
 
+test("a durable peer wait suppresses empty-ending recovery even if a steer clears the silent flag", () => {
+  assert.equal(emptyEndingNote(base({ ref: { modelCalls: 48, peerWaitId: "wait-1", silentRequested: false } })), null);
+});
+
 test("a paused turn (approval or input wall) ends mid-loop legitimately", () => {
   assert.equal(emptyEndingNote(base({ ref: { modelCalls: 48, pausedOnApproval: true } })), null);
   assert.equal(emptyEndingNote(base({ ref: { modelCalls: 48, pendingApprovals: [{}] } })), null);

@@ -1,4 +1,5 @@
 import { NonRetryableTurnError } from "../core/turn-error.ts";
+import { swallow } from "../util/errors.ts";
 import { resolveTurnOrigin } from "../core/turn-origin.ts";
 import { conversationScope } from "../resolution/resolution-service.ts";
 import type { Run, RunStore } from "../runs/run-store.ts";
@@ -12,12 +13,40 @@ export function createPeerExecution(deps: {
   store: PeerExecutionStore;
   sessions: SessionStore;
   runs: RunStore;
-}): RunExecutionAdmission & { sweep(): Promise<void>; usage(peerId: string): Promise<ExecutionUsage> } {
+}): RunExecutionAdmission & {
+  sweep(): Promise<void>;
+  sourceReleased(runId: string): Promise<boolean>;
+  usage(peerId: string): Promise<ExecutionUsage>;
+} {
   async function ownsRun(run: Run): Promise<boolean> {
     const current = await deps.runs.get(run.id);
     return current?.status === "running" && current.leaseToken === run.leaseToken;
   }
+  async function recordAdmission(run: Run): Promise<"admitted"> {
+    try {
+      if (!(await ownsRun(run))) throw new Error("Execution admission lost its run lease.");
+      await deps.store.recordStart(run.id, run.attempts);
+      if (!(await ownsRun(run))) throw new Error("Execution admission lost its run lease.");
+      return "admitted";
+    } catch (error) {
+      const cleanup = await Promise.allSettled([
+        ...(run.leaseToken ? [deps.store.release(run.id, run.leaseToken)] : []),
+        deps.store.recordRelease(run.id, run.attempts, run.leaseToken),
+      ]);
+      for (const result of cleanup)
+        if (result.status === "rejected") swallow("unstarted execution cleanup", result.reason);
+      throw error;
+    }
+  }
   return {
+    async sourceReleased(runId) {
+      const run = await deps.runs.get(runId);
+      return (
+        !!run &&
+        (run.status === "done" || run.status === "failed") &&
+        (await deps.store.wasReleased(runId, run.attempts))
+      );
+    },
     async usage(peerId) {
       const peer = await deps.repository.get("peer", peerId);
       if (!peer) throw new Error("Peer identity is unavailable.");
@@ -30,9 +59,9 @@ export function createPeerExecution(deps: {
       const fromPeer = origin === "peer";
       if (!peer) {
         if (fromPeer) throw new NonRetryableTurnError("Peer identity is unavailable.");
-        return "admitted";
+        return recordAdmission(run);
       }
-      if (!peer.parentId && !fromPeer) return "admitted";
+      if (!peer.parentId && !fromPeer) return recordAdmission(run);
       if (peer.state !== "active" || (peer.parentId && !peer.sandboxId))
         throw new NonRetryableTurnError("Agent is not ready for autonomous execution.");
       if (conversationScope(run.request.conversation, run.request.actor.id) !== peer.scopeId)
@@ -45,17 +74,18 @@ export function createPeerExecution(deps: {
         scopeId: peer.scopeId,
         autonomous: origin !== "human" && origin !== "direct",
       });
-      if (result === "admitted" && !(await ownsRun(run))) {
-        await deps.store.release(run.id, run.leaseToken);
-        throw new Error("Execution admission lost its run lease.");
-      }
-      return result;
+      return result === "admitted" ? recordAdmission(run) : result;
     },
     async release(run) {
+      await deps.store.recordRelease(run.id, run.attempts, run.leaseToken);
       if (run.leaseToken) await deps.store.release(run.id, run.leaseToken);
     },
     async sweep() {
       for (const execution of await deps.store.active()) {
+        if (await deps.store.wasTokenReleased(execution.runId, execution.token)) {
+          await deps.store.release(execution.runId, execution.token);
+          continue;
+        }
         const run = await deps.runs.get(execution.runId);
         if (!run || run.status !== "running" || run.leaseToken !== execution.token)
           await deps.store.orphan(execution.runId, execution.token);
