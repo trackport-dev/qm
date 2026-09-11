@@ -446,6 +446,7 @@ export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37San
   const sandbox: Sandbox = {
     profile,
     startProcess: procSessions.startProcess,
+    startRegisteredProcess: procSessions.startRegisteredProcess,
     readProcess: procSessions.readProcess,
     writeStdin: procSessions.writeStdin,
     signalProcess: procSessions.signalProcess,

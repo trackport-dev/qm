@@ -49,7 +49,7 @@ const FAMILIES: AgentApiFamily[] = [
     match: (m, p) =>
       (m === "POST" && p === "/v1/peer-spawns") ||
       (m === "GET" && /^\/v1\/peers\/[^/]+\/subtree$/.test(p)) ||
-      (m === "PUT" && /^\/v1\/peers\/[^/]+\/subtree-limit$/.test(p)),
+      (m === "PUT" && /^\/v1\/peers\/[^/]+\/(?:subtree-limit|execution-limits)$/.test(p)),
     guidance:
       "Spawn independent QM sessions with fresh computers and a task brief. Parent identity is derived from your live capability. Retries must reuse idempotencyKey. Every ancestor's recursive limit applies; stopped or archived descendants still count. No workspace or conversation copying.",
     routes: [
@@ -68,6 +68,12 @@ const FAMILIES: AgentApiFamily[] = [
         method: "PUT",
         path: "/v1/peers/:id/subtree-limit",
         summary: "lower your own descendant cap with {limit}; raising limits or exceeding existing counts is refused",
+      },
+      {
+        method: "PUT",
+        path: "/v1/peers/:id/execution-limits",
+        summary:
+          "lower your scope concurrency and root-tree autonomous turn budget with {concurrencyLimit,turnLimit}; increases and limits below current usage are refused",
       },
     ],
   },

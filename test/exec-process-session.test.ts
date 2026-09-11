@@ -44,6 +44,35 @@ function fixture(): {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+test("registered process launch persists identity before dispatch and retains it after lost acknowledgement", async () => {
+  const registered: string[] = [];
+  let launches = 0;
+  const proc = createExecProcessSessions({
+    async run(_handle, command) {
+      launches++;
+      assert.equal(registered.length, 1);
+      assert.ok(command.includes(registered[0]!));
+      throw new Error("launch acknowledgement lost");
+    },
+  });
+  const handle = { id: "test", rootDir: "/workspace" };
+  await assert.rejects(
+    proc.startRegisteredProcess(handle, "echo task", async () => {
+      throw new Error("registration unavailable");
+    }),
+    /registration unavailable/,
+  );
+  assert.equal(launches, 0);
+  await assert.rejects(
+    proc.startRegisteredProcess(handle, "echo task", async (id) => {
+      registered.push(id);
+    }),
+    /launch acknowledgement lost/,
+  );
+  assert.equal(launches, 1);
+  assert.equal(registered.length, 1);
+});
+
 test("a started process is reattachable: cursor reads stream its output then exit", async () => {
   const { proc, handle } = fixture();
   const { processId } = await proc.startProcess(handle, "for i in 1 2 3; do echo line$i; sleep 0.05; done");

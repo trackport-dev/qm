@@ -132,10 +132,15 @@ export interface ServerDeps {
   sessions?: SessionStore;
   peerIdentity?: PeerIdentity;
   peerBoard?: PeerBoard;
+  peerInspection?: {
+    board: Pick<PeerBoard, "list" | "get" | "preview">;
+    waits: Pick<PeerWaits, "list" | "get">;
+    spawning: Pick<PeerSpawning, "inspect" | "tree">;
+  };
   peerWaits?: PeerWaits;
   peerSpawning?: PeerSpawning;
   peerLifecycle?: PeerLifecycle;
-  peerExecution?: import("../coordination/execution.ts").PeerExecutionService;
+  peerExecution?: ReturnType<typeof import("../coordination/execution.ts").createPeerExecution>;
   peerSpawnBackend?: SandboxBackendName;
   screenSecurity?: SecurityScreenProbe;
   auditLog?: AuditLog;

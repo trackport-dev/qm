@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { evaluateAudience } from "./audience.ts";
-import type { CoordinationRepository, PeerMessageQuery } from "./repository.ts";
+import type { CoordinationRepository, PeerMessageQuery, CoordinationRunFence } from "./repository.ts";
 import { CoordinationError, type AudienceCandidate, type PeerMessage } from "./types.ts";
 
 export interface PublishPeerMessage {
@@ -25,7 +25,7 @@ export function createPeerBoard(repository: CoordinationRepository) {
       const input = await candidates();
       return { candidates: input, recipientIds: await evaluateAudience(audience, input) };
     },
-    async publish(input: PublishPeerMessage): Promise<PeerMessage> {
+    async publish(input: PublishPeerMessage, fence?: CoordinationRunFence): Promise<PeerMessage> {
       if (!input.text.trim() || Buffer.byteLength(input.text) > 64 * 1024)
         throw new CoordinationError(400, "invalid_message", "message must contain 1–65536 bytes");
       if (!input.idempotencyKey || input.idempotencyKey.length > 200)
@@ -97,6 +97,7 @@ export function createPeerBoard(repository: CoordinationRepository) {
           }
           return message;
         },
+        fence,
       );
     },
     async get(id: string) {

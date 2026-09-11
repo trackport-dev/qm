@@ -57,6 +57,7 @@ const continuation = {
   replyTo: null,
   threadId: "continuation",
   recipientIds: ["planner"],
+  audience: '.[] | select(._qm.id == "planner")',
   createdAt: now - 20_000,
   continuation: { kind: "reply_wait", waitId: "completed-wait" },
   text: "The selected recipient replied. Resume the suspended work using the linked public reply.",
@@ -64,6 +65,38 @@ const continuation = {
 const timeline = [...messages, continuation];
 export const request: typeof api = async <T>(path: string): Promise<T> => {
   const url = new URL(path, location.origin);
+  if (url.pathname === "/api/peers/planner/subtree")
+    return {
+      manageable: true,
+      nodes: [
+        { peer: { ...candidates[0]!, parentId: null, state: "active" }, count: 2, cap: 2 },
+        {
+          peer: {
+            id: "intermediate",
+            name: "Previous coordinator",
+            parentId: "planner",
+            state: "deleted",
+            character: { role: "coordinator" },
+          },
+          count: 1,
+          cap: 16,
+          spawn: { state: "ready", attempts: 1, updatedAt: now - 60_000, reason: null },
+        },
+        { peer: { ...candidates[1]!, parentId: "intermediate", state: "active" }, count: 0, cap: 16 },
+        {
+          peer: {
+            id: "unfinished",
+            name: "Interrupted provisioning",
+            parentId: "planner",
+            state: "deleted",
+            character: { role: "worker" },
+          },
+          count: 0,
+          cap: 16,
+          spawn: { state: "failed", attempts: 2, updatedAt: now - 10_000, reason: "spawn_session_unavailable" },
+        },
+      ],
+    } as T;
   const waits = [
     {
       id: "completed-wait",
@@ -133,4 +166,6 @@ export const request: typeof api = async <T>(path: string): Promise<T> => {
 appState.currentView = "board";
 appState.mainEl = document.querySelector<HTMLElement>("#board-demo");
 document.body.style.overflow = "auto";
+if (location.pathname === "/test/support/board-demo.html" || location.pathname === "/")
+  history.replaceState(history.state, "", "/board/request");
 await renderBoardPage(request);

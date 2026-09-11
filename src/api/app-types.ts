@@ -205,7 +205,13 @@ interface DeploymentGitUrl {
 }
 
 interface SessionBackgroundView {
-  jobs: Array<{ processId: string; command: string; startedAt: number; expiresAt: number }>;
+  jobs: Array<{
+    processId: string;
+    command: string;
+    startedAt: number;
+    expiresAt: number;
+    launchUnconfirmed?: boolean;
+  }>;
   watches: Array<{
     id: string;
     processId: string;
@@ -222,7 +228,7 @@ interface SessionBackgroundView {
 interface SessionBackgroundOutput {
   chunk: string;
   cursor: number;
-  state: "running" | "exited";
+  state: "starting" | "running" | "exited";
   exitCode?: number;
 }
 

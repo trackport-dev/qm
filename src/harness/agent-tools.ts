@@ -48,6 +48,7 @@ export interface ToolContextRef {
   suspendPeerWait?(id: string): Promise<void>;
   peerWaitId?: string;
   onExecutionPending?(operation: Promise<void>): void;
+  authorizeToolExecution?(): Promise<void>;
   runtimeHandoff?: RuntimeHandoff;
   runtimeRunId?: string;
   runtimeActorId?: string;
@@ -1665,10 +1666,12 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
                     type: "text" as const,
                     text: jobs.length
                       ? jobs
-                          .map(
-                            (j) =>
-                              `${j.processId}  ${j.registryStatus === "reaped" ? "stopped (ttl)" : fmtStatus(j.status)}  ${new Date(j.startedAt).toISOString()}  ${j.command}`,
-                          )
+                          .map((j) => {
+                            let status = fmtStatus(j.status);
+                            if (j.registryStatus === "starting") status = "launch unconfirmed";
+                            if (j.registryStatus === "reaped") status = "stopped (ttl)";
+                            return `${j.processId}  ${status}  ${new Date(j.startedAt).toISOString()}  ${j.command}`;
+                          })
                           .join("\n")
                       : "(no background jobs)",
                   },
@@ -3731,10 +3734,12 @@ function withToolBodyTiming(tool: ToolDefinition, ref: ToolContextRef): ToolDefi
     ...tool,
     async execute(callId: string, params: unknown) {
       const start = Date.now();
+      const authorize = ref.authorizeToolExecution;
       try {
-        const operation = Promise.resolve().then(() =>
-          (inner as (callId: string, params: unknown) => unknown)(callId, params),
-        );
+        const operation = Promise.resolve().then(async () => {
+          await authorize?.();
+          return (inner as (callId: string, params: unknown) => unknown)(callId, params);
+        });
         ref.onExecutionPending?.(operation.then(() => {}));
         return await operation;
       } finally {

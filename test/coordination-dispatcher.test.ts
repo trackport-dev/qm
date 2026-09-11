@@ -144,6 +144,28 @@ for (const blocker of ["authority", "approval", "paused", "archived"] as const) 
   });
 }
 
+test("blocked delivery sweeps wait for the retry deadline then resume without losing the message", async (t) => {
+  let now = 20_000;
+  t.mock.method(Date, "now", () => now);
+  const f = await setup();
+  f.state.blocked = true;
+  await f.dispatcher.sweep();
+  const blocked = await f.repository.get("delivery", f.id);
+  assert.equal(blocked?.state, "blocked");
+  const events = await f.repository.events(0, 200);
+  f.state.blocked = false;
+  now += 4_999;
+  await f.dispatcher.sweep();
+  assert.equal(f.queued.length, 0);
+  assert.deepEqual(await f.repository.get("delivery", f.id), blocked);
+  assert.deepEqual(await f.repository.events(0, 200), events);
+  now += 1;
+  await f.dispatcher.sweep();
+  assert.equal(f.queued.length, 1);
+  assert.equal((await f.repository.get("delivery", f.id))?.state, "delivered");
+  assert.equal((await f.repository.get("delivery", f.id))?.attempts, 2);
+});
+
 test("dispatcher uses bounded pending reads instead of scanning delivery history", async () => {
   const f = await setup();
   const list = f.repository.list.bind(f.repository);

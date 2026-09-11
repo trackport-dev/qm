@@ -364,12 +364,19 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     });
   }
 
+  async function bindRunSession(input: OrchestratorInput, sessionId: string): Promise<void> {
+    if (input.runId && deps.runs && input.runLeaseToken)
+      if (!(await deps.runs.bindSession(input.runId, input.runLeaseToken, sessionId)))
+        throw new Error("run lease or session incarnation changed before execution");
+  }
+
   async function acquireTurnLeaseOrRefuse(args: {
     sessionId: string;
     site: "turn" | "flagged_input";
     scopeId: ScopeId;
     automated: boolean;
     runId?: string;
+    runLeaseToken?: string;
     surface?: string;
   }): Promise<{ lease: Lease; waitedMs: number } | { lease: null; waitedMs: number; refusal: TurnResult }> {
     const budget = deps.turnLeaseWaitMs ?? CONFIG_DEFAULTS.turnLeaseWaitMs;
@@ -378,7 +385,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       args.sessionId,
       "turn",
       args.automated ? Math.min(AUTOMATED_TURN_LEASE_WAIT_MS, budget) : budget,
-      { waitFor: (heldBy) => heldBy !== undefined && heldBy !== "turn" },
+      {
+        waitFor: (heldBy) => heldBy !== undefined && heldBy !== "turn",
+        ...(args.runId && args.runLeaseToken
+          ? { owner: { runId: args.runId, runLeaseToken: args.runLeaseToken } }
+          : {}),
+      },
     );
     const waitedMs = attempt.waitedMs ?? 0;
     if (attempt.lease) return { lease: attempt.lease, waitedMs };
@@ -440,6 +452,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       if (securitySteersInFlight.has(conversation.threadRef)) return block("steer-in-flight");
       const bounded = securityScreenPayload({
         surface: "external",
+        origin: { kind: origin },
         text: "",
         triggered: true,
         securityScreenData: payload,
@@ -816,11 +829,13 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           input.surface,
         );
         screenSession.id = session.id;
+        await bindRunSession(input, session.id);
         if (!input.sessionParticipantIds?.length && !automatedTurn)
           await deps.sessions.addParticipant(session.id, actor.id);
         const acquired = await acquireTurnLeaseOrRefuse({
           sessionId: session.id,
           site: "flagged_input",
+          runLeaseToken: input.runLeaseToken,
           scopeId,
           automated: automatedTurn,
           ...(input.runId ? { runId: input.runId } : {}),
@@ -1152,6 +1167,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         input.surface,
       );
       screenSession.id = session.id;
+      await bindRunSession(input, session.id);
       if (actor.type === "internal" && deps.peerIdentity) {
         await deps.peerIdentity.ensure({
           id: session.id,
@@ -1441,7 +1457,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           ...(liveAuthorTurn ? { liveAuthor: true } : {}),
           ...(automatedTurn ? { triggered: true } : {}),
           ...(!liveTurn && input.unattendedGrants ? { grants: input.unattendedGrants } : {}),
-          ...(input.runId ? { runId: input.runId } : {}),
+          ...(input.runId ? { runId: input.runId, ...(input.attempt ? { runAttempt: input.attempt } : {}) } : {}),
+          ...(input.runLeaseToken ? { runLeaseToken: input.runLeaseToken } : {}),
           threadRef: conversation.threadRef,
         };
         connectorEnv.AGENT_API_TOKEN = await mintCapabilityToken(
@@ -1628,6 +1645,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const acquired = await acquireTurnLeaseOrRefuse({
         sessionId: session.id,
         site: "turn",
+        runLeaseToken: input.runLeaseToken,
         scopeId,
         automated: automatedTurn,
         ...(input.runId ? { runId: input.runId } : {}),
@@ -2005,6 +2023,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 provisionSandbox: provisionResource,
                 scopeId: memoryScopeId,
                 sessionRef: conversation.threadRef,
+                ...(input.runId ? { runId: input.runId } : {}),
+                ...(input.runId && input.attempt !== undefined ? { runAttempt: input.attempt } : {}),
                 ...(deps.backgroundJobTtlMs !== undefined ? { ttlMs: deps.backgroundJobTtlMs } : {}),
                 ...(deps.backgroundJobTtlMaxMs !== undefined ? { ttlMaxMs: deps.backgroundJobTtlMaxMs } : {}),
               })
@@ -2845,6 +2865,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ...(input.runId ? { runId: input.runId } : {}),
             cancel: turnAbort.signal,
             onExecutionPending: input.onExecutionPending,
+            authorizeToolExecution: input.authorizeToolExecution,
             ...(deps.peerWaits && input.runId
               ? {
                   suspendPeerWait: async (id: string) => {

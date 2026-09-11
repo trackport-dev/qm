@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createMemoryCoordinationRepository } from "../src/coordination/repository.ts";
+import {
+  createMemoryCoordinationRepository,
+  createPostgresCoordinationRepository,
+} from "../src/coordination/repository.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { createPgPool } from "../src/persistence/pg-pool.ts";
+import { randomUUID } from "node:crypto";
 import { createPeerIdentity } from "../src/coordination/identity.ts";
 import { createPeerSpawning } from "../src/coordination/spawning.ts";
 import { createPeerSpawnWorker } from "../src/coordination/spawn-worker.ts";
@@ -9,6 +15,206 @@ import { createMemorySessionStore } from "../src/sessions/memory-session-store.t
 import type { SandboxResource } from "../src/sandbox/sandbox-resources.ts";
 import { conversationScope } from "../src/resolution/resolution-service.ts";
 import { publicSpawn } from "../src/coordination/types.ts";
+
+for (const target of ["parent", "child"] as const) {
+  test(`memory binding holds ${target} deletion until its commit`, async (t) => {
+    const repository = createMemoryCoordinationRepository();
+    const sessions = createMemorySessionStore();
+    const parent = await sessions.getOrCreateByThread("binding-lock", "dm", "personal:owner");
+    const authority = {
+      actor: { id: "owner", type: "internal" as const },
+      conversation: { kind: "dm" as const, threadRef: parent.threadRef, audience: [] },
+      surface: "web",
+    };
+    await createPeerIdentity(repository).ensure({ id: parent.id, scopeId: parent.scopeId, authority });
+    const spawn = await createPeerSpawning(repository).reserve({
+      parentId: parent.id,
+      parentRunId: "run",
+      backend: "local",
+      idempotencyKey: "lock",
+      name: "Child",
+      task: "Work",
+    });
+    const deletedId = target === "parent" ? parent.id : spawn.childId;
+    let deletion: Promise<void> | undefined;
+    let deleted = false;
+    const transaction = repository.transaction.bind(repository);
+    t.mock.method(
+      repository,
+      "transaction",
+      (locks: Parameters<typeof transaction>[0], action: Parameters<typeof transaction>[1]) =>
+        transaction(locks, async (tx) => {
+          const put = tx.put.bind(tx);
+          t.mock.method(tx, "put", async (kind: Parameters<typeof put>[0], row: Parameters<typeof put>[1]) => {
+            if (kind === "peer" && row.id === spawn.childId && "sandboxId" in row && row.sandboxId && !deletion) {
+              deletion = sessions.deleteSession(deletedId).then(() => {
+                deleted = true;
+              });
+              await new Promise((resolve) => setImmediate(resolve));
+              assert.equal(deleted, false);
+              assert.ok(await sessions.get(deletedId));
+            }
+            return put(kind, row);
+          });
+          return action(tx);
+        }),
+    );
+    const worker = createPeerSpawnWorker({
+      repository,
+      sessions,
+      authorize: async () => authority,
+      participants: async () => ["owner"],
+      resources: {
+        async create() {
+          return {
+            id: spawn.childId,
+            ownerScopeId: parent.scopeId,
+            backingScopeId: `sandbox-${spawn.childId}`,
+            backend: "local",
+            name: "Child",
+            createdBy: "owner",
+            createdAt: new Date().toISOString(),
+            legacy: false,
+            state: "ready",
+          };
+        },
+      },
+      board: {
+        async publish() {
+          throw new Error("stop after binding");
+        },
+      },
+      dispatcher: {
+        async dispatch() {
+          assert.fail("not reached");
+        },
+      },
+    });
+    await assert.rejects(worker.advance(spawn.id), /stop after binding/);
+    assert.ok(deletion);
+    await deletion;
+    assert.equal(deleted, true);
+    assert.equal((await repository.get("peer", spawn.childId))?.sandboxId, spawn.childId);
+    assert.equal(await sessions.get(deletedId), null);
+  });
+  for (const backend of ["memory", "postgres"] as const) {
+    test(
+      `${backend} spawn binding rejects ${target} deletion after final authority lookup`,
+      { skip: backend === "postgres" && !process.env.COORDINATION_TEST_DATABASE_URL },
+      async (t) => {
+        const database = process.env.COORDINATION_TEST_DATABASE_URL;
+        const pool = createPgPool(database ?? "postgres://unused");
+        t.after(() => pool.close());
+        const repository =
+          backend === "memory"
+            ? createMemoryCoordinationRepository()
+            : createPostgresCoordinationRepository(pool, randomUUID(), { postgresSessions: true });
+        const sessions = backend === "memory" ? createMemorySessionStore() : createPostgresSessionStore(database!);
+        const parent = await sessions.getOrCreateByThread(`parent-binding:${randomUUID()}`, "dm", "personal:owner");
+        const authority = {
+          actor: { id: "owner", type: "internal" as const },
+          conversation: { kind: "dm" as const, threadRef: parent.threadRef, audience: [] },
+          surface: "web",
+        };
+        await createPeerIdentity(repository).ensure({ id: parent.id, scopeId: parent.scopeId, authority });
+        const spawning = createPeerSpawning(repository);
+        const spawn = await spawning.reserve({
+          parentId: parent.id,
+          parentRunId: "run",
+          backend: "local",
+          idempotencyKey: "binding",
+          name: "Child",
+          task: "Work",
+        });
+        let authorizations = 0;
+        const worker = createPeerSpawnWorker({
+          repository,
+          sessions,
+          board: createPeerBoard(repository),
+          authorize: async () => {
+            if (++authorizations === 2) await sessions.deleteSession(target === "parent" ? parent.id : spawn.childId);
+            return authority;
+          },
+          participants: async () => ["owner"],
+          resources: {
+            async create() {
+              return {
+                id: spawn.childId,
+                ownerScopeId: parent.scopeId,
+                backingScopeId: `sandbox-${spawn.childId}`,
+                backend: "local",
+                name: "Child",
+                createdBy: "owner",
+                createdAt: new Date().toISOString(),
+                legacy: false,
+                state: "ready",
+              };
+            },
+          },
+          dispatcher: {
+            async dispatch() {
+              assert.fail("deleted session must not dispatch");
+            },
+          },
+        });
+        await assert.rejects(worker.advance(spawn.id), /spawn session was deleted/);
+        assert.equal((await repository.get("peer", spawn.childId))?.sandboxId, null);
+        assert.equal((await repository.list("message")).length, 0);
+        assert.equal((await spawning.inspect(parent.id)).count, 1);
+      },
+    );
+  }
+  test(`spawn recovery does not resurrect a deleted ${target}`, async () => {
+    const repository = createMemoryCoordinationRepository();
+    const sessions = createMemorySessionStore();
+    const authority = {
+      actor: { id: "owner", type: "internal" as const },
+      conversation: { kind: "dm" as const, threadRef: "web:owner:parent", audience: [] },
+      surface: "web",
+    };
+    const scope = conversationScope(authority.conversation, "owner");
+    const parent = await sessions.getOrCreateByThread(authority.conversation.threadRef, "dm", scope);
+    await createPeerIdentity(repository).ensure({ id: parent.id, scopeId: scope, authority });
+    const spawning = createPeerSpawning(repository);
+    const spawn = await spawning.reserve({
+      parentId: parent.id,
+      parentRunId: "run",
+      backend: "local",
+      idempotencyKey: "deleted-recovery",
+      name: "Worker",
+      task: "Build",
+    });
+    let provisions = 0;
+    const worker = createPeerSpawnWorker({
+      repository,
+      sessions,
+      board: createPeerBoard(repository),
+      authorize: async () => authority,
+      participants: async () => ["owner"],
+      resources: {
+        async create() {
+          provisions++;
+          throw new Error("provision unavailable");
+        },
+      },
+      dispatcher: {
+        async dispatch() {
+          assert.fail("deleted spawn must not dispatch");
+        },
+      },
+    });
+    await assert.rejects(worker.advance(spawn.id), /provision unavailable/);
+    assert.ok(await sessions.get(spawn.childId));
+    await sessions.deleteSession(spawn.childId);
+    if (target === "parent") await sessions.deleteSession(parent.id);
+    await assert.rejects(worker.advance(spawn.id), target === "parent" ? /parent is unavailable/ : /deleted session/);
+    assert.equal(await sessions.get(spawn.childId), null);
+    assert.equal(provisions, 1);
+    assert.equal((await spawning.inspect(parent.id)).count, 1);
+    assert.equal((await repository.get("peer", spawn.childId))?.parentId, parent.id);
+    assert.equal((await repository.list("message")).length, 0);
+  });
+}
 
 for (const kind of ["dm", "group", "channel"] as const) {
   for (const explicitRef of [false, true]) {
@@ -26,10 +232,12 @@ for (const kind of ["dm", "group", "channel"] as const) {
         surface: "web",
       };
       const scope = conversationScope(authority.conversation, "owner");
-      await identity.ensure({ id: "parent", scopeId: scope, authority });
+      const sessions = createMemorySessionStore();
+      const parent = await sessions.getOrCreateByThread(authority.conversation.threadRef, kind, scope);
+      await identity.ensure({ id: parent.id, scopeId: scope, authority });
       const spawning = createPeerSpawning(repository);
       const spawn = await spawning.reserve({
-        parentId: "parent",
+        parentId: parent.id,
         parentRunId: "parent-run",
         backend: "local",
         idempotencyKey: "spawn",
@@ -37,7 +245,6 @@ for (const kind of ["dm", "group", "channel"] as const) {
         character: { role: "worker" },
         task: "Build the thing",
       });
-      const sessions = createMemorySessionStore();
       const computers = new Map<string, SandboxResource>();
       let failProvision = true;
       let failDispatch = true;
@@ -87,7 +294,7 @@ for (const kind of ["dm", "group", "channel"] as const) {
       };
       await assert.rejects(createPeerSpawnWorker(deps).advance(spawn.id), /lost provision response/);
       assert.equal((await repository.get("spawn", spawn.id))?.state, "failed");
-      const failedNode = (await spawning.tree("parent")).find((node) => node.peer.id === spawn.childId)!;
+      const failedNode = (await spawning.tree(parent.id)).find((node) => node.peer.id === spawn.childId)!;
       assert.equal(failedNode.spawn?.state, "failed");
       assert.equal(failedNode.spawn?.attempts, 1);
       assert.equal(failedNode.spawn?.reason, "spawn_provisioning_failed");
@@ -103,7 +310,7 @@ for (const kind of ["dm", "group", "channel"] as const) {
       assert.ok(retries.some((result) => result.state === "ready" && result.runId === "initial-run"));
       assert.equal((await repository.get("spawn", spawn.id))?.state, "ready");
       assert.equal(computers.size, 1);
-      const readyNode = (await spawning.tree("parent")).find((node) => node.peer.id === spawn.childId)!;
+      const readyNode = (await spawning.tree(parent.id)).find((node) => node.peer.id === spawn.childId)!;
       assert.equal(readyNode.spawn?.state, "ready");
       assert.equal(readyNode.spawn?.attempts, 3);
       assert.equal(readyNode.spawn?.reason, null);
@@ -121,7 +328,7 @@ for (const kind of ["dm", "group", "channel"] as const) {
       assert.equal(message.senderRunId, "parent-run");
       assert.equal(message.text, "Build the thing");
       assert.deepEqual(message.recipientIds, [child.id]);
-      assert.equal((await spawning.inspect("parent")).count, 1);
+      assert.equal((await spawning.inspect(parent.id)).count, 1);
     });
   }
 }

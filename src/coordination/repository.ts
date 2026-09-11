@@ -1,5 +1,8 @@
 import { createKeyedQueue } from "../util/async.ts";
-import { withPgTransaction, type PgPool, type PoolClient } from "../persistence/pg-pool.ts";
+import type { PgPool, PoolClient } from "../persistence/pg-pool.ts";
+import type { RunStore } from "../runs/run-store.ts";
+import { assertRunFence, withFencedPgTransaction, type CoordinationRunFence } from "./run-fence.ts";
+export type { CoordinationRunFence } from "./run-fence.ts";
 import type {
   CoordinationEvent,
   CoordinationKind,
@@ -9,6 +12,8 @@ import type {
   PeerSpawn,
   PeerWait,
 } from "./types.ts";
+
+const BLOCKED_DELIVERY_RETRY_MS = 5_000;
 
 export interface PeerMessageQuery {
   after: number;
@@ -22,13 +27,13 @@ export interface PeerMessageQuery {
   role?: string;
 }
 
-export interface PeerMessagePage {
+interface PeerMessagePage {
   messages: Omit<PeerMessage, "candidates">[];
   nextCursor: number;
   hasMore: boolean;
 }
 
-export interface CoordinationRead {
+interface CoordinationRead {
   waitPage(
     messageId: string,
     after: string,
@@ -56,7 +61,11 @@ export interface CoordinationTransaction extends CoordinationRead {
 }
 
 export interface CoordinationRepository extends CoordinationRead {
-  transaction<T>(locks: readonly string[], action: (tx: CoordinationTransaction) => Promise<T>): Promise<T>;
+  transaction<T>(
+    locks: readonly string[],
+    action: (tx: CoordinationTransaction) => Promise<T>,
+    fence?: CoordinationRunFence,
+  ): Promise<T>;
 }
 
 function eventWindow(after: number, limit: number): void {
@@ -66,7 +75,9 @@ function eventWindow(after: number, limit: number): void {
 
 type MemoryRows = { [K in CoordinationKind]: Map<string, CoordinationRows[K]> };
 
-export function createMemoryCoordinationRepository(): CoordinationRepository {
+export function createMemoryCoordinationRepository(
+  deps: { runs?: Pick<RunStore, "get"> } = {},
+): CoordinationRepository {
   let rows: MemoryRows = {
     peer: new Map(),
     message: new Map(),
@@ -143,7 +154,13 @@ export function createMemoryCoordinationRepository(): CoordinationRepository {
       eventWindow(now, limit);
       return structuredClone(
         [...data.delivery.values()]
-          .filter((row) => row.state !== "consumed" && row.state !== "failed" && row.leaseUntil <= now)
+          .filter(
+            (row) =>
+              row.state !== "consumed" &&
+              row.state !== "failed" &&
+              row.leaseUntil <= now &&
+              (row.state !== "blocked" || row.updatedAt + BLOCKED_DELIVERY_RETRY_MS <= now),
+          )
           .sort((a, b) => a.updatedAt - b.updatedAt || a.id.localeCompare(b.id))
           .slice(0, limit),
       );
@@ -211,8 +228,10 @@ export function createMemoryCoordinationRepository(): CoordinationRepository {
     pendingSpawns: (now, limit) => read(rows, events).pendingSpawns(now, limit),
     livePeerIds: (after, limit) => read(rows, events).livePeerIds(after, limit),
     messagePage: (query) => read(rows, events).messagePage(query),
-    transaction: (_locks, action) =>
+    transaction: (_locks, action, fence) =>
       queue("transaction", async () => {
+        const run = fence ? ((await deps.runs?.get(fence.runId)) ?? null) : null;
+        if (fence) assertRunFence(fence, run);
         const next = structuredClone(rows);
         const log = structuredClone(events);
         const tx: CoordinationTransaction = {
@@ -228,6 +247,7 @@ export function createMemoryCoordinationRepository(): CoordinationRepository {
           },
         };
         const result = await action(tx);
+        if (fence) assertRunFence(fence, run);
         rows = next;
         events = log;
         return structuredClone(result);
@@ -281,7 +301,7 @@ const spawnIndexMigration = {
 export function createPostgresCoordinationRepository(
   pg: PgPool,
   orgId: string,
-  opts: { postgresSessions?: boolean } = {},
+  opts: { postgresSessions?: boolean; memoryRuns?: () => RunStore } = {},
 ): CoordinationRepository {
   if (!orgId) throw new Error("coordination requires an organization");
   pg.registerMigration(migration);
@@ -414,8 +434,9 @@ export function createPostgresCoordinationRepository(
            WHERE org_id=$1 AND kind='delivery'
              AND json->>'state' IN ('queued', 'delivered', 'blocked')
              AND (json->>'leaseUntil')::bigint <= $2
+             AND (json->>'state' <> 'blocked' OR (json->>'updatedAt')::bigint + $4 <= $2)
            ORDER BY (json->>'updatedAt')::bigint, id COLLATE "C" LIMIT $3`,
-          [orgId, now, limit],
+          [orgId, now, limit, BLOCKED_DELIVERY_RETRY_MS],
         );
         return result.map((row) => row.json);
       },
@@ -468,50 +489,55 @@ export function createPostgresCoordinationRepository(
   };
   return {
     ...read(),
-    async transaction(locks, action) {
+    async transaction(locks, action, fence) {
       await ready();
-      return withPgTransaction(await pg.pool(), async (client) => {
-        await client.query("SET LOCAL lock_timeout = '10s'");
-        await client.query("SET LOCAL statement_timeout = '15s'");
-        for (const key of [...new Set(locks)].sort()) {
-          await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-            JSON.stringify(["coordination", orgId, key]),
-          ]);
-        }
-        return action({
-          ...read(client),
-          ...(opts.postgresSessions
-            ? {
-                sessionExists: async (id: string) => {
-                  const result = await client.query("SELECT 1 FROM sessions WHERE id=$1", [id]);
-                  return result.rows.length > 0;
-                },
-              }
-            : {}),
-          async put(kind, row) {
-            await client.query(
-              "INSERT INTO coordination_records (org_id, kind, id, json) VALUES ($1,$2,$3,$4) ON CONFLICT (org_id,kind,id) DO UPDATE SET json=EXCLUDED.json",
-              [orgId, kind, row.id, JSON.stringify(row)],
-            );
-          },
-          async event(kind, id, at) {
-            const result = await client.query(
-              "INSERT INTO coordination_cursors (org_id,seq) VALUES ($1,1) ON CONFLICT (org_id) DO UPDATE SET seq=coordination_cursors.seq+1 RETURNING seq",
-              [orgId],
-            );
-            const sequence = Number(result.rows[0].seq);
-            if (!Number.isSafeInteger(sequence)) throw new Error("coordination event sequence exhausted");
-            await client.query("INSERT INTO coordination_events (org_id,seq,kind,id,at) VALUES ($1,$2,$3,$4,$5)", [
-              orgId,
-              sequence,
-              kind,
-              id,
-              at,
+      return withFencedPgTransaction(
+        pg,
+        async (client) => {
+          for (const key of [...new Set(locks)].sort()) {
+            await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+              JSON.stringify(["coordination", orgId, key]),
             ]);
-            return sequence;
-          },
-        });
-      });
+          }
+          const result = await action({
+            ...read(client),
+            ...(opts.postgresSessions
+              ? {
+                  sessionExists: async (id: string) => {
+                    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [id]);
+                    const result = await client.query("SELECT 1 FROM sessions WHERE id=$1", [id]);
+                    return result.rows.length > 0;
+                  },
+                }
+              : {}),
+            async put(kind, row) {
+              await client.query(
+                "INSERT INTO coordination_records (org_id, kind, id, json) VALUES ($1,$2,$3,$4) ON CONFLICT (org_id,kind,id) DO UPDATE SET json=EXCLUDED.json",
+                [orgId, kind, row.id, JSON.stringify(row)],
+              );
+            },
+            async event(kind, id, at) {
+              const result = await client.query(
+                "INSERT INTO coordination_cursors (org_id,seq) VALUES ($1,1) ON CONFLICT (org_id) DO UPDATE SET seq=coordination_cursors.seq+1 RETURNING seq",
+                [orgId],
+              );
+              const sequence = Number(result.rows[0].seq);
+              if (!Number.isSafeInteger(sequence)) throw new Error("coordination event sequence exhausted");
+              await client.query("INSERT INTO coordination_events (org_id,seq,kind,id,at) VALUES ($1,$2,$3,$4,$5)", [
+                orgId,
+                sequence,
+                kind,
+                id,
+                at,
+              ]);
+              return sequence;
+            },
+          });
+          return result;
+        },
+        fence,
+        opts.memoryRuns,
+      );
     },
   };
 }

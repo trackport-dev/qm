@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createKeyedQueue } from "../util/async.ts";
 import { assertSessionReservation } from "./session-store.ts";
 import { reservedOrRandomId } from "../util/reserved-id.ts";
 import type { Session, SessionEntry, ScopeId } from "../types.ts";
@@ -10,6 +11,7 @@ import type {
   GetTapeOptions,
   LeaseAttempt,
   LeaseHolder,
+  SessionLeaseOwner,
   LeasePeek,
   LlmRequestRecord,
   NewEntry,
@@ -69,9 +71,17 @@ function idDesc(a: string, b: string): number {
 }
 
 export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore {
+  const sessionQueue = createKeyedQueue();
+  const withSessionLocks = <T>(ids: readonly string[], action: () => Promise<T>): Promise<T> => {
+    const ordered = [...new Set(ids)].sort();
+    const acquire = (index: number): Promise<T> =>
+      index === ordered.length ? action() : sessionQueue(ordered[index]!, () => acquire(index + 1));
+    return acquire(0);
+  };
   const now = opts.now ?? (() => Date.now());
   const leaseTtlMs = opts.leaseTtlMs ?? 5 * 60_000;
   const sessions = new Map<string, Session>();
+  const deletedSessions = new Set<string>();
   const entries = new Map<string, SessionEntry[]>();
   const tape = new Map<string, TapeRecord[]>();
   const searchIndex = new Map<string, NewSearchEntry[]>();
@@ -98,7 +108,10 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       }
     >
   >();
-  const leases = new Map<string, { token: string; expiresAt: number; acquiredAt: number; holder?: LeaseHolder }>();
+  const leases = new Map<
+    string,
+    { token: string; expiresAt: number; acquiredAt: number; holder?: LeaseHolder; owner?: SessionLeaseOwner }
+  >();
 
   const participantSession = (sessionId: string, principalId: string): Session | null => {
     const s = sessions.get(sessionId);
@@ -119,10 +132,25 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
     };
   };
 
+  function deleteSession(sessionId: string): void {
+    const s = sessions.get(sessionId);
+    if (s) deletedSessions.add(sessionId);
+    if (s) byThread.delete(s.threadRef);
+    for (const principalId of windows.get(sessionId)?.keys() ?? []) participants.get(principalId)?.delete(sessionId);
+    sessions.delete(sessionId);
+    entries.delete(sessionId);
+    tape.delete(sessionId);
+    searchIndex.delete(sessionId);
+    llmRequests.delete(sessionId);
+    windows.delete(sessionId);
+    leases.delete(sessionId);
+    pins.delete(sessionId);
+  }
   return {
     leaseTtlMs,
     async getOrCreateByThread(threadRef, type, scopeId, channelName, surface, reservedId) {
       const id = reservedOrRandomId(reservedId);
+      if (deletedSessions.has(id)) throw new Error("session reservation refers to a deleted session");
       const existingId = byThread.get(threadRef);
       if (existingId) {
         const s = sessions.get(existingId);
@@ -168,7 +196,7 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       if (s) Object.assign(s, provenance);
     },
 
-    async acquireLease(sessionId, holder): Promise<LeaseAttempt> {
+    async acquireLease(sessionId, holder, owner): Promise<LeaseAttempt> {
       if (!sessions.has(sessionId)) return { lease: null };
       const held = leases.get(sessionId);
       if (held && now() < held.expiresAt)
@@ -184,6 +212,7 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
         expiresAt: now() + leaseTtlMs,
         acquiredAt: now(),
         ...(holder ? { holder } : {}),
+        ...(owner ? { owner: { ...owner } } : {}),
       });
       return { lease: { sessionId, token } };
     },
@@ -205,33 +234,32 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       if (leases.get(lease.sessionId)?.token === lease.token) leases.delete(lease.sessionId);
     },
 
+    withSessionLocks,
     async deleteSession(sessionId) {
-      const s = sessions.get(sessionId);
-      if (s) byThread.delete(s.threadRef);
-      for (const principalId of windows.get(sessionId)?.keys() ?? []) {
-        participants.get(principalId)?.delete(sessionId);
-      }
-      sessions.delete(sessionId);
-      entries.delete(sessionId);
-      tape.delete(sessionId);
-      searchIndex.delete(sessionId);
-      llmRequests.delete(sessionId);
-      windows.delete(sessionId);
-      leases.delete(sessionId);
-      pins.delete(sessionId);
+      await withSessionLocks([sessionId], async () => {
+        deleteSession(sessionId);
+      });
+    },
+
+    async wasDeleted(sessionId) {
+      return deletedSessions.has(sessionId);
     },
 
     async deleteSessionIfEmpty(sessionId) {
-      if (!sessions.has(sessionId)) return false;
-      if ((entries.get(sessionId)?.length ?? 0) > 0) return false;
-      const held = leases.get(sessionId);
-      if (held && now() < held.expiresAt) return false;
-      await this.deleteSession(sessionId);
-      return true;
+      return withSessionLocks([sessionId], async () => {
+        if (!sessions.has(sessionId)) return false;
+        if ((entries.get(sessionId)?.length ?? 0) > 0) return false;
+        const held = leases.get(sessionId);
+        if (held && now() < held.expiresAt) return false;
+        deleteSession(sessionId);
+        return true;
+      });
     },
 
-    async forceReleaseLease(sessionId) {
-      leases.delete(sessionId);
+    async forceReleaseLease(sessionId, owner) {
+      const held = leases.get(sessionId);
+      if (!owner || (held?.owner?.runId === owner.runId && held.owner.runLeaseToken === owner.runLeaseToken))
+        leases.delete(sessionId);
     },
 
     async append(lease, entry: NewEntry): Promise<SessionEntry> {

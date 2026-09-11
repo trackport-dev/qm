@@ -1739,6 +1739,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           const turnWallClockMs = turn.turnWallClockMs ?? defaultTurnWallClockMs;
           entry.ref.current = turn.tools;
           entry.ref.onExecutionPending = turn.onExecutionPending;
+          entry.ref.authorizeToolExecution = turn.authorizeToolExecution;
           entry.ref.suspendPeerWait = turn.suspendPeerWait;
           entry.ref.peerWaitId = undefined;
           entry.ref.runtimeHandoff = undefined;

@@ -21,7 +21,7 @@ export function createPeerSpawnWorker(deps: {
   const leases = createSpawnLease(deps.repository);
   async function activeAuthority(spawn: PeerSpawn): Promise<PeerAuthority> {
     const parent = await deps.repository.get("peer", spawn.parentId);
-    if (!parent || parent.state !== "active")
+    if (!parent || parent.state !== "active" || !(await deps.sessions.get(parent.id)))
       throw new CoordinationError(409, "spawn_parent_unavailable", "spawn parent is unavailable");
     const authority = await deps.authorize(parent);
     if (!authority) throw new CoordinationError(403, "execution_authority_revoked", "spawn authority is unavailable");
@@ -69,28 +69,37 @@ export function createPeerSpawnWorker(deps: {
       };
       if (conversationScope(conversation, currentAuthority.actor.id) !== child.scopeId)
         throw new CoordinationError(409, "spawn_scope_changed", "child authority does not match its reserved scope");
-      await deps.repository.transaction([`tree:${spawn.rootId}`, `peer:${child.id}`, `spawn:${id}`], async (tx) => {
-        const operation = await tx.get("spawn", id);
-        assertSpawnLease(operation, token);
-        const current = await tx.get("peer", child.id);
-        const parent = await tx.get("peer", spawn.parentId);
-        if (!current || current.state !== "active" || parent?.state !== "active")
-          throw new CoordinationError(409, "spawn_child_unavailable", "reserved child is unavailable");
-        const now = Date.now();
-        await tx.put("peer", {
-          ...current,
-          sandboxId: resource.id,
-          authority: {
-            ...currentAuthority,
-            surface: "web",
-            conversation,
-          },
-          updatedAt: now,
+      const bind = () =>
+        deps.repository.transaction([`tree:${spawn.rootId}`, `peer:${child.id}`, `spawn:${id}`], async (tx) => {
+          const operation = await tx.get("spawn", id);
+          assertSpawnLease(operation, token);
+          for (const sessionId of [spawn.parentId, child.id].sort()) {
+            const exists = tx.sessionExists
+              ? await tx.sessionExists(sessionId)
+              : !!(await deps.sessions.get(sessionId));
+            if (!exists) throw new CoordinationError(409, "spawn_session_unavailable", "spawn session was deleted");
+          }
+          const current = await tx.get("peer", child.id);
+          const parent = await tx.get("peer", spawn.parentId);
+          if (!current || current.state !== "active" || parent?.state !== "active")
+            throw new CoordinationError(409, "spawn_child_unavailable", "reserved child is unavailable");
+          const now = Date.now();
+          await tx.put("peer", {
+            ...current,
+            sandboxId: resource.id,
+            authority: {
+              ...currentAuthority,
+              surface: "web",
+              conversation,
+            },
+            updatedAt: now,
+          });
+          await tx.put("spawn", { ...operation, sandboxId: resource.id, updatedAt: now });
+          await tx.event("peer", child.id, now);
+          await tx.event("spawn", id, now);
         });
-        await tx.put("spawn", { ...operation, sandboxId: resource.id, updatedAt: now });
-        await tx.event("peer", child.id, now);
-        await tx.event("spawn", id, now);
-      });
+      if (deps.sessions.withSessionLocks) await deps.sessions.withSessionLocks([spawn.parentId, child.id], bind);
+      else await bind();
       const message = await deps.board.publish({
         senderId: spawn.parentId,
         senderRunId: spawn.parentRunId,

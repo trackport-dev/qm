@@ -437,6 +437,35 @@ const call = (tool: ReturnType<typeof createAgentTools>[number] | undefined, par
   return (tool.execute as unknown as (id: string, p: unknown) => Promise<unknown>)("t", params);
 };
 
+test("tool execution refuses a stale attempt before entering its body", async () => {
+  const context = fakeToolContext();
+  let entered = false;
+  context.execute = async () => {
+    entered = true;
+    return { stdout: "", stderr: "", code: 0, timedOut: false };
+  };
+  let tracked = false;
+  const tools = createAgentTools({
+    current: context,
+    authorizeToolExecution: async () => {
+      throw new Error("attempt closed");
+    },
+    onExecutionPending(operation) {
+      tracked = true;
+      void operation.catch(() => {});
+    },
+  });
+  await assert.rejects(
+    call(
+      tools.find((tool) => tool.name === "execute"),
+      { command: "work" },
+    ),
+    /attempt closed/,
+  );
+  assert.equal(entered, false);
+  assert.equal(tracked, true);
+});
+
 test("tool execution tracking remains pending until the tool body exits", async () => {
   let finish!: () => void;
   const gate = new Promise<void>((resolve) => {

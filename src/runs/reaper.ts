@@ -1,4 +1,4 @@
-import type { ReapEvent, RunStore } from "./run-store.ts";
+import type { ReapEvent, RunStore, RetiredSessionLease } from "./run-store.ts";
 import type { SessionStore } from "../sessions/session-store.ts";
 import type { ErrorLog } from "../admin/error-log.ts";
 import type { ScopeId } from "../types.ts";
@@ -23,11 +23,8 @@ export interface Reaper {
   sweep(): Promise<{ requeued: number; parked: number }>;
 }
 
-async function releaseStrandedSessionLeases(sessions: SessionStore, sessionIds: string[]): Promise<void> {
-  for (const threadRef of new Set(sessionIds)) {
-    const session = await sessions.getByThread(threadRef);
-    if (session) await sessions.forceReleaseLease(session.id);
-  }
+async function releaseStrandedSessionLeases(sessions: SessionStore, leases: RetiredSessionLease[]): Promise<void> {
+  for (const lease of leases) await sessions.forceReleaseLease(lease.sessionId, lease);
 }
 
 export interface ReaperOptions {
@@ -41,7 +38,7 @@ export function createReaper(runs: RunStore, sessions: SessionStore, opts: Reape
   const leaderLease = opts.leaderLease ?? createNoopLeaderLease();
   const { errors } = opts;
   const reap = (): Promise<{ requeued: number; parked: number }> =>
-    runs.reapExpired((retiredSessionIds) => releaseStrandedSessionLeases(sessions, retiredSessionIds), {
+    runs.reapExpired((_threadRefs, sessionLeases) => releaseStrandedSessionLeases(sessions, sessionLeases), {
       ...(opts.maxAgeMs !== undefined ? { maxAgeMs: opts.maxAgeMs } : {}),
       ...(errors ? { onReap: (e: ReapEvent) => recordReapEvent(errors, e) } : {}),
     });

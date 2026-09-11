@@ -277,6 +277,7 @@ export function createPorterSandbox(workspace: WorkspaceStore, opts: PorterSandb
   const sandbox: Sandbox = {
     profile,
     startProcess: procSessions.startProcess,
+    startRegisteredProcess: procSessions.startRegisteredProcess,
     readProcess: procSessions.readProcess,
     writeStdin: procSessions.writeStdin,
     signalProcess: procSessions.signalProcess,

@@ -392,6 +392,7 @@ export function createSmolmachinesSandbox(workspace: WorkspaceStore, opts: Smolm
   return {
     profile,
     startProcess: procSessions.startProcess,
+    startRegisteredProcess: procSessions.startRegisteredProcess,
     readProcess: procSessions.readProcess,
     writeStdin: procSessions.writeStdin,
     signalProcess: procSessions.signalProcess,

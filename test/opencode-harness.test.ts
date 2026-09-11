@@ -521,6 +521,35 @@ test("OpenCode config options forward a judge model only when its provider has a
   assert.equal(openCodeHarnessConfigOptions({} as Config).judgeModelId, undefined);
 });
 
+for (const nativeSubagents of [true, false]) {
+  test(`OpenCode per-turn tools preserve the native delegation policy (${nativeSubagents})`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "qm-opencode-delegation-"));
+    const dump = join(dir, "prompt.json");
+    const harness = createOpenCodeHarness({
+      nativeSubagents,
+      binaryPath: fakeSidecar(
+        dir,
+        "delegation",
+        `
+        if (req.method === "POST" && message) {
+          require("node:fs").writeFileSync(${JSON.stringify(dump)}, await readBody(req));
+          return json(res, ${okAssistant});
+        }
+        if (req.method === "GET" && message) return json(res, [${okAssistant}]);
+      `,
+      ),
+    });
+    t.after(async () => {
+      await harness.turns.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    await harness.turns.runTurn(turnInput([], []));
+    assert.equal(JSON.parse(readFileSync(dump, "utf8")).tools.task, nativeSubagents);
+    await harness.turns.runTurn({ ...turnInput([], []), readOnly: true });
+    assert.equal(JSON.parse(readFileSync(dump, "utf8")).tools.task, false);
+  });
+}
+
 test("custom providers materialize into the opencode config (enabled + provider map, key included)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "opencode-custom-"));
   const dump = join(dir, "config.json");
@@ -534,6 +563,7 @@ test("custom providers materialize into the opencode config (enabled + provider 
   chmodSync(wrapped, 0o755);
   const harness = createOpenCodeHarness({
     binaryPath: wrapped,
+    nativeSubagents: false,
     resolveCustomProviders: async () => [
       {
         spec: {
@@ -552,6 +582,9 @@ test("custom providers materialize into the opencode config (enabled + provider 
   try {
     await harness.turns.runTurn(turnInput(entries, llmRows));
     const config = JSON.parse(readFileSync(dump, "utf8"));
+    assert.equal(config.tools.task, false);
+    assert.equal(config.agent.qm.tools.task, false);
+    assert.equal(config.permission.task, "deny");
     assert.ok(config.enabled_providers.includes("litellm"));
     const litellm = config.provider.litellm;
     assert.equal(litellm.npm, "@ai-sdk/openai-compatible");

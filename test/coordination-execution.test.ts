@@ -14,6 +14,73 @@ import {
 const database = process.env.COORDINATION_TEST_DATABASE_URL;
 for (const backend of ["memory", "postgres"] as const) {
   test(
+    `lowered execution limits survive concurrent admission and reconstruction: ${backend}`,
+    { skip: backend === "postgres" && !database },
+    async (t) => {
+      const pool = createPgPool(database ?? "postgres://unused");
+      t.after(() => pool.close());
+      const org = randomUUID();
+      const first =
+        backend === "memory" ? createMemoryPeerExecutionStore() : createPostgresPeerExecutionStore(pool, org);
+      const second = backend === "memory" ? first : createPostgresPeerExecutionStore(pool, org);
+      await first.lowerLimits("root", "scope", 2, 3);
+      await assert.rejects(second.lowerLimits("root", "scope", 3, 2), /only lower/);
+      assert.equal((await first.usage("root", "scope")).turnLimit, 3);
+      const input = { rootId: "root", scopeId: "scope", token: "token", autonomous: true };
+      const results = await Promise.all(
+        Array.from({ length: 10 }, (_, i) => (i % 2 ? first : second).admit({ ...input, runId: String(i) })),
+      );
+      assert.equal(results.filter((result) => result === "admitted").length, 2);
+      await assert.rejects(first.lowerLimits("root", "scope", 1, 3), /current usage/);
+      await assert.rejects(first.lowerLimits("root", "scope", 2, 1), /current usage/);
+      for (const row of await first.active()) await first.release(row.runId, row.token);
+      const changes = await Promise.allSettled([
+        first.lowerLimits("root", "scope", 1, 3),
+        second.lowerLimits("root", "scope", 2, 3),
+      ]);
+      assert.ok(changes.some((result) => result.status === "fulfilled"));
+      assert.equal((await second.usage("root", "scope")).concurrencyLimit, 1);
+      assert.equal(await second.admit({ ...input, runId: "last" }), "admitted");
+      assert.equal(await first.admit({ ...input, rootId: "other", runId: "other-root" }), "concurrency_limit");
+      await first.release("last", "token");
+      assert.equal(await first.admit({ ...input, runId: "over" }), "turn_limit");
+      assert.equal((await first.usage("other", "scope")).turnLimit, 200);
+      assert.equal((await first.usage("root", "other-scope")).concurrencyLimit, 4);
+      const raced = await Promise.allSettled([
+        first.lowerLimits("race-root", "race-scope", 1, 1),
+        ...Array.from({ length: 6 }, (_, i) =>
+          second.admit({
+            ...input,
+            rootId: "race-root",
+            scopeId: "race-scope",
+            runId: `race-${i}`,
+          }),
+        ),
+      ]);
+      const raceUsage = await second.usage("race-root", "race-scope");
+      assert.ok(raceUsage.activeInScope <= raceUsage.concurrencyLimit);
+      assert.ok(raceUsage.autonomousTurns <= raceUsage.turnLimit);
+      if (raced[0]!.status === "fulfilled") {
+        assert.equal(raceUsage.concurrencyLimit, 1);
+        assert.equal(raceUsage.turnLimit, 1);
+        assert.equal(raceUsage.activeInScope, 1);
+      } else {
+        assert.match(String(raced[0]!.reason), /current usage/);
+        assert.equal(raceUsage.concurrencyLimit, 4);
+        assert.equal(raceUsage.turnLimit, 200);
+      }
+      if (backend === "postgres") {
+        const restored = createPostgresPeerExecutionStore(pool, org, 8, 400);
+        assert.equal((await restored.usage("root", "scope")).concurrencyLimit, 1);
+        assert.equal((await restored.usage("root", "scope")).turnLimit, 3);
+        const tightened = createPostgresPeerExecutionStore(pool, org, 1, 2);
+        assert.equal((await tightened.usage("root", "scope")).turnLimit, 2);
+      }
+    },
+  );
+}
+for (const backend of ["memory", "postgres"] as const) {
+  test(
     `execution admission: ${backend} scope concurrency, root budgets and fenced retries`,
     { skip: backend === "postgres" && !database },
     async (t) => {

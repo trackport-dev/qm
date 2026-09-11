@@ -113,6 +113,8 @@ export function createMonitorBroker(deps: MonitorBrokerDeps): MonitorBroker {
       if (!rec || rec.scopeId !== deps.scopeId || rec.kind !== "background") {
         throw new Error("no such background job to watch");
       }
+      if (rec.status === "starting")
+        throw new Error("background job launch is unconfirmed; retry after acknowledgement");
       if (rec.status !== "running") {
         const tail = await deps.readOutputTail(processId, WATCH_COMPLETED_TAIL_BYTES);
         return {

@@ -151,6 +151,20 @@ for (const backend of ["memory", "postgres"] as const) {
       if (racingSpawn.status === "fulfilled")
         assert.equal((await first.get("peer", racingSpawn.value.childId))?.state, "stopped");
       else assert.equal(racingSpawn.reason.code, "spawn_parent_unavailable");
+      await first.transaction(["tree:root"], async (tx) => {
+        const peer = (await tx.get("peer", grandchild.childId))!;
+        await tx.put("peer", { ...peer, state: "deleted", authority: null });
+      });
+      assert.equal((await services[1]!.inspect("root")).count, 16);
+      await assert.rejects(services[1]!.reserve({ ...request, idempotencyKey: "deleted-reservation-overflow" }), {
+        code: "subtree_limit_exceeded",
+      });
+      await assert.rejects(services[1]!.lowerLimit("root", 15), { code: "invalid_subtree_limit" });
+      assert.ok(
+        (await services[1]!.tree("root")).some(
+          (row) => row.peer.id === grandchild.childId && row.peer.state === "deleted",
+        ),
+      );
     },
   );
 }

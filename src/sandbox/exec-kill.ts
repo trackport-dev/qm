@@ -6,7 +6,13 @@ export function pgidMarkerPath(uid: string): string {
 
 export function killableScript(innerScript: string, uid: string): string {
   const marker = shq(pgidMarkerPath(uid));
-  const inner = `echo $$ > ${marker} 2>/dev/null; ${innerScript}
+  const cancelled = shq(`${pgidMarkerPath(uid)}.cancelled`);
+  const inner = `echo $$ > ${marker} 2>/dev/null || exit 125
+if [ -e ${cancelled} ]; then
+  rm -f ${marker} 2>/dev/null
+  exit 130
+fi
+${innerScript}
 __pi_exec_rc=$?
 rm -f ${marker} 2>/dev/null
 exit $__pi_exec_rc`;
@@ -15,7 +21,9 @@ exit $__pi_exec_rc`;
 
 export function killScript(uid: string): string {
   const marker = shq(pgidMarkerPath(uid));
-  return `i=0
+  const cancelled = shq(`${pgidMarkerPath(uid)}.cancelled`);
+  return `: > ${cancelled} || exit 125
+i=0
 while [ $i -lt 5 ]; do
   pgid=$(cat ${marker} 2>/dev/null)
   if [ -n "$pgid" ]; then kill -KILL -"$pgid" 2>/dev/null; rm -f ${marker} 2>/dev/null; break; fi

@@ -11,10 +11,18 @@ type Script = (prompts: AsyncIterable<{ message: { content: unknown } }>) => Asy
 const toolHandlers = new Map<string, (args: unknown) => Promise<unknown>>();
 
 let currentScript: Script = async function* () {};
+let queryOptions: Record<string, unknown> = {};
 
 mock.module("@anthropic-ai/claude-agent-sdk", {
   namedExports: {
-    query: ({ prompt }: { prompt: AsyncIterable<{ message: { content: unknown } }> }) => {
+    query: ({
+      prompt,
+      options,
+    }: {
+      prompt: AsyncIterable<{ message: { content: unknown } }>;
+      options: Record<string, unknown>;
+    }) => {
+      queryOptions = options;
       const generator = currentScript(prompt);
       return {
         async initializationResult() {
@@ -105,6 +113,23 @@ function harnessTurn(overrides: Partial<HarnessTurnInput> = {}): {
   return { turn, entries, modelCalls, llmRequests };
 }
 
+for (const nativeSubagents of [true, false]) {
+  test(`Claude native delegation follows the coordination policy (${nativeSubagents})`, async () => {
+    currentScript = async function* () {
+      yield resultMessage("done");
+    };
+    const harness = createClaudeHarness({ nativeSubagents });
+    try {
+      await harness.turns.runTurn(harnessTurn({ readOnly: false }).turn);
+      assert.deepEqual(queryOptions.tools, nativeSubagents ? ["Agent"] : []);
+      assert.equal((queryOptions.allowedTools as string[]).includes("Agent"), nativeSubagents);
+      assert.equal(Boolean(queryOptions.agents), nativeSubagents);
+    } finally {
+      await harness.turns.close?.();
+    }
+  });
+}
+
 for (const peer of [false, true]) {
   test(`a steered turn persists every reply, not only the last result's (peer=${peer})`, async () => {
     const peerOrigin = peer
@@ -164,7 +189,8 @@ for (const peer of [false, true]) {
       .map((entry) => (entry.payload as { text: string }).text);
     assert.deepEqual(userTexts, ["what is the capital of france?", "now do the other three"]);
     const steered = entries.find((entry) => (entry.payload as { steered?: boolean })?.steered);
-    assert.deepEqual((steered?.payload as { peerOrigin?: unknown }).peerOrigin, peerOrigin);
+    assert.ok(steered);
+    assert.deepEqual((steered.payload as { peerOrigin?: unknown }).peerOrigin, peerOrigin);
   });
 }
 

@@ -4,8 +4,148 @@ import { test } from "node:test";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { createPeerIdentity } from "../src/coordination/identity.ts";
+import { createPeerSpawning } from "../src/coordination/spawning.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import { SECURITY_SCREEN_STEP } from "../src/security/security-posture.ts";
+
+test("disabled coordination parks an existing child's synchronous human turn", async () => {
+  const built = buildApp(testConfig({ coordinationEnabled: false }));
+  const parent = await built.sessions.getOrCreateByThread("disabled-parent", "dm", "personal:owner");
+  const authority = {
+    actor: { id: "owner", type: "internal" as const },
+    conversation: { kind: "dm" as const, threadRef: parent.threadRef, audience: [] },
+    surface: "test",
+  };
+  await createPeerIdentity(built.coordinationRepository).ensure({ id: parent.id, scopeId: parent.scopeId, authority });
+  const spawn = await createPeerSpawning(built.coordinationRepository).reserve({
+    parentId: parent.id,
+    parentRunId: "source",
+    backend: "local",
+    idempotencyKey: "disabled-child",
+    name: "Child",
+    task: "Work",
+  });
+  const child = await built.sessions.getOrCreateByThread(
+    "disabled-child",
+    "dm",
+    parent.scopeId,
+    undefined,
+    "test",
+    spawn.childId,
+  );
+  const result = await built.app.turn({
+    surface: "test",
+    actor: { externalId: "owner" },
+    conversation: { kind: "dm", threadRef: child.threadRef },
+    text: "Continue",
+  });
+  assert.equal(result.status, "queued");
+  assert.equal(result.reason, "coordination_paused");
+  assert.ok(result.runId);
+  assert.equal((await built.runs.get(result.runId))?.status, "pending");
+  assert.deepEqual(await built.sessions.listLlmRequests(child.id), []);
+});
+
+for (const kind of ["channel", "group"] as const) {
+  for (const mode of ["queued", "live", "unknown", "queued-teams", "live-teams"] as const) {
+    test(`peer wakes refresh ${kind} rosters and fence ${mode} audiences`, async (t) => {
+      const built = buildApp(testConfig({ coordinationEnabled: true, backgroundWorkEnabled: true }));
+      t.after(() => built.runtime.stop());
+      const teamChange = mode.endsWith("-teams");
+      let hasTeam = true;
+      const classify = built.identity.classify.bind(built.identity);
+      if (teamChange)
+        t.mock.method(built.identity, "classify", (id: string, guest?: boolean) => ({
+          ...classify(id, guest),
+          ...(id === "member" ? { teamIds: hasTeam ? ["engineering"] : [] } : {}),
+        }));
+      await built.app.upsertDirectory(
+        ["owner", "member"].map((principalId) => ({ principalId, displayName: principalId, type: "internal" })),
+      );
+      const ref = kind === "channel" ? "C-roster" : "G-roster";
+      let revision = Date.now();
+      const replaceRoster = async (ids: string[]) => {
+        if (kind === "channel")
+          await built.directory.replaceChannels(
+            [{ channelId: ref, name: "room", isPrivate: true }],
+            ids.map((principalId) => ({ channelId: ref, principalId })),
+            ++revision,
+            [ref],
+          );
+        else
+          await built.directory.replaceGroups(
+            ids.map((principalId) => ({ groupId: ref, principalId })),
+            ++revision,
+            [ref],
+            [ref],
+          );
+      };
+      await replaceRoster(["owner"]);
+      const initial = await built.app.turn({
+        surface: "test",
+        actor: { externalId: "owner" },
+        conversation: { kind, channelRef: ref, threadRef: `${kind}:peer-roster`, audience: [{ externalId: "owner" }] },
+        text: "Start work",
+      });
+      assert.equal(initial.status, "ok", initial.reason);
+      const session = (await built.sessions.get(initial.sessionId!))!;
+      await replaceRoster(["owner", "member"]);
+      const message = await built.peerBoard!.publish({
+        senderId: session.id,
+        senderRunId: "source",
+        idempotencyKey: "roster",
+        text: "Continue work",
+        audience: `.[] | select(._qm.id == ${JSON.stringify(session.id)})`,
+      });
+      await built.peerDispatcher!.dispatch(`${message.id}:${session.id}`);
+      const delivery = (await built.coordinationRepository.get("delivery", `${message.id}:${session.id}`))!;
+      assert.equal(delivery.state, "delivered", delivery.reason ?? "");
+      const run = (await built.runs.get(delivery.runId!))!;
+      assert.deepEqual(run.request.conversation.audience.map((member) => member.id).sort(), ["member", "owner"]);
+      assert.deepEqual(run.request.conversation.publishMembers, run.request.conversation.audience);
+      assert.equal(run.request.conversation.isPrivate, true);
+      if (teamChange) hasTeam = false;
+      else await replaceRoster(["owner"]);
+      const before = await built.sessions.listLlmRequests(session.id);
+      if (!mode.startsWith("queued")) {
+        assert.ok(await built.runs.claimById(run.id, "live-roster-worker", 30_000));
+        if (mode === "unknown") t.mock.method(built.directory, "conversationMembers", async () => undefined);
+        const next = await built.peerBoard!.publish({
+          senderId: session.id,
+          senderRunId: "source",
+          idempotencyKey: "changed-roster",
+          text: "Review progress",
+          audience: `.[] | select(._qm.id == ${JSON.stringify(session.id)})`,
+        });
+        await built.peerDispatcher!.dispatch(`${next.id}:${session.id}`);
+        const nextDelivery = (await built.coordinationRepository.get("delivery", `${next.id}:${session.id}`))!;
+        assert.deepEqual(await built.signals.takeLive(run.id), []);
+        assert.deepEqual(await built.sessions.listLlmRequests(session.id), before);
+        if (mode === "unknown") {
+          assert.equal(nextDelivery.state, "blocked");
+          assert.equal(nextDelivery.reason, "execution_authority_revoked");
+          assert.equal(nextDelivery.runId, null);
+        } else {
+          assert.equal(nextDelivery.state, "delivered", nextDelivery.reason ?? "");
+          assert.notEqual(nextDelivery.runId, run.id);
+          const followup = (await built.runs.get(nextDelivery.runId!))!;
+          assert.equal(followup.status, "pending");
+          assert.deepEqual(
+            followup.request.conversation.audience.map((member) => member.id).sort(),
+            teamChange ? ["member", "owner"] : ["owner"],
+          );
+          if (teamChange) assert.ok(followup.request.conversation.audience.every((member) => !member.teamIds?.length));
+        }
+        return;
+      }
+      built.runtime.start();
+      const completed = await built.runs.waitFor(run.id, 5_000);
+      assert.equal(completed.result?.status, "refused");
+      assert.match(completed.result?.reason ?? "", /peer execution authority/);
+      assert.deepEqual(await built.sessions.listLlmRequests(session.id), before);
+    });
+  }
+}
 
 for (const surface of ["test", "web"]) {
   for (const continuation of [false, true]) {
@@ -246,6 +386,7 @@ for (const revoked of ["owner", "private-channel"] as const) {
     const built = buildApp(testConfig({ coordinationEnabled: true, backgroundWorkEnabled: true }));
     t.after(() => built.runtime.stop());
     const syncedAt = Date.now();
+    await built.app.upsertDirectory([{ principalId: "owner", displayName: "Owner", type: "internal" }]);
     const channels = [{ channelId: "C-private", name: "private", isPrivate: true }];
     if (revoked === "private-channel")
       await built.app.upsertChannels(channels, [{ channelId: "C-private", principalId: "owner" }], syncedAt, [

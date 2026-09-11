@@ -14,6 +14,7 @@ import { tapeCheckpointPayload, tapeEntryMirrorRecord } from "../sessions/sessio
 import { swallow } from "../util/errors.ts";
 
 export interface HarnessToolPlumbing {
+  nativeSubagents?: boolean;
   scratchExec?: boolean;
   ownerAuthExec?: boolean;
   reachExec?: boolean;
@@ -71,6 +72,7 @@ export function harnessToolContext(turn: HarnessTurnInput): ToolContextRef {
   return {
     current: turn.tools,
     onExecutionPending: turn.onExecutionPending,
+    authorizeToolExecution: turn.authorizeToolExecution,
     suspendPeerWait: turn.suspendPeerWait,
     runtimeRunId: turn.runId,
     runtimeActorId: turn.runtimeActorId,

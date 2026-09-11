@@ -3,7 +3,7 @@ import type { ScopeId } from "../types.ts";
 import type { SessionStore } from "../sessions/session-store.ts";
 import type { RunStore } from "../runs/run-store.ts";
 import { conversationScope } from "../resolution/resolution-service.ts";
-import type { CoordinationRepository } from "./repository.ts";
+import type { CoordinationRepository, CoordinationRunFence } from "./repository.ts";
 import { CoordinationError, publicPeer, type Character, type Peer, type PeerAuthority } from "./types.ts";
 
 export const DEFAULT_DESCENDANT_LIMIT = 16;
@@ -40,7 +40,7 @@ export function createPeerIdentity(
   async function historicalAuthority(id: string, scopeId: ScopeId): Promise<PeerAuthority | null> {
     const session = await history!.sessions.get(id);
     if (!session || session.scopeId !== scopeId) return null;
-    const run = await history!.runs.firstExecutedForThread(session.threadRef);
+    const run = await history!.runs.firstExecutedForSession(session.threadRef, session.id);
     if (!run) return null;
     const { actor, conversation, surface, scopeVersion } = run.request;
     if (
@@ -68,7 +68,7 @@ export function createPeerIdentity(
         if (existing) {
           if (existing.scopeId !== input.scopeId)
             throw new CoordinationError(409, "peer_scope_changed", "session scope differs from its peer identity");
-          if (!existing.authority && authority) {
+          if (existing.state !== "deleted" && !existing.authority && authority) {
             const updated = { ...existing, authority };
             await tx.put("peer", updated);
             return updated;
@@ -104,30 +104,39 @@ export function createPeerIdentity(
     async list() {
       return (await repository.list("peer")).filter((peer) => peer.state !== "deleted").map(publicPeer);
     },
-    async replace(id: string, expectedVersion: number, input: { character: unknown; name?: string }) {
+    async replace(
+      id: string,
+      expectedVersion: number,
+      input: { character: unknown; name?: string },
+      fence?: CoordinationRunFence,
+    ) {
       const character = characterObject(input.character);
       const name = input.name === undefined ? undefined : peerName(input.name);
-      return repository.transaction([`peer:${id}`], async (tx) => {
-        const peer = await tx.get("peer", id);
-        if (!peer || peer.state === "deleted") throw new CoordinationError(404, "peer_not_found", "agent not found");
-        if (peer.version !== expectedVersion)
-          throw new CoordinationError(
-            409,
-            "character_conflict",
-            "character changed; read the current version before retrying",
-            { version: peer.version },
-          );
-        const updated = {
-          ...peer,
-          character,
-          name: name ?? peer.name,
-          version: peer.version + 1,
-          updatedAt: Date.now(),
-        };
-        await tx.put("peer", updated);
-        await tx.event("peer", id, updated.updatedAt);
-        return publicPeer(updated);
-      });
+      return repository.transaction(
+        [`peer:${id}`],
+        async (tx) => {
+          const peer = await tx.get("peer", id);
+          if (!peer || peer.state === "deleted") throw new CoordinationError(404, "peer_not_found", "agent not found");
+          if (peer.version !== expectedVersion)
+            throw new CoordinationError(
+              409,
+              "character_conflict",
+              "character changed; read the current version before retrying",
+              { version: peer.version },
+            );
+          const updated = {
+            ...peer,
+            character,
+            name: name ?? peer.name,
+            version: peer.version + 1,
+            updatedAt: Date.now(),
+          };
+          await tx.put("peer", updated);
+          await tx.event("peer", id, updated.updatedAt);
+          return publicPeer(updated);
+        },
+        fence,
+      );
     },
   };
 }

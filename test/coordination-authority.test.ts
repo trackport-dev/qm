@@ -56,7 +56,7 @@ for (const backend of ["memory", "postgres"] as const) {
         sessionId: thread,
         request: { ...request, actor: { id: "never-ran", type: "internal" } },
       });
-      assert.equal(await runs.firstExecutedForThread(thread), null);
+      assert.equal(await runs.firstExecutedForSession(thread, session.id), null);
       const original = await runs.enqueue({ sessionId: thread, request });
       const claim = await runs.claimById(original.run.id, "worker", 30_000);
       assert.ok(claim);
@@ -83,9 +83,68 @@ for (const backend of ["memory", "postgres"] as const) {
         assert.equal(peer.authority?.actor.id, "alice");
         assert.deepEqual(Object.keys(peer.authority!).sort(), ["actor", "conversation", "surface"]);
       }
-      assert.equal((await runs.firstExecutedForThread(thread))?.id, original.run.id);
+      assert.equal((await runs.firstExecutedForSession(thread, session.id))?.id, original.run.id);
       assert.equal((await runs.get(pending.run.id))?.status, "pending");
       assert.equal((await repository.get("peer", session.id))?.authority?.actor.id, "alice");
+    },
+  );
+}
+
+for (const backend of ["memory", "postgres"] as const) {
+  test(
+    `session incarnation: ${backend} binds live claims without inheriting thread history`,
+    { skip: backend === "postgres" && !database },
+    async (t) => {
+      const runtime = backend === "memory" ? createMemoryRunStore() : createPostgresRunStore(database!);
+      const { runs } = runtime;
+      t.after(async () => {
+        await runs.close?.();
+      });
+      const sessions = createMemorySessionStore();
+      const repository = createMemoryCoordinationRepository();
+      const identity = createPeerIdentity(repository, { sessions, runs });
+      const threadRef = `incarnation:${randomUUID()}`;
+      const scope = scopeId("group", threadRef);
+      const request: OrchestratorInput = {
+        actor: { id: "alice", type: "internal" },
+        conversation: { kind: "group", threadRef, audience: [] },
+        origin: { kind: "human" },
+        text: "Original task",
+      };
+      const { run } = await runs.enqueue({ sessionId: threadRef, request });
+      const claim = await runs.claimById(run.id, "worker", 30_000);
+      assert.ok(claim?.leaseToken);
+      const original = await sessions.getOrCreateByThread(threadRef, "group", scope);
+      assert.equal((await identity.ensure({ id: original.id, scopeId: scope })).authority, null);
+      assert.equal(await runs.bindSession(run.id, "wrong-token", original.id), false);
+      assert.equal(await runs.bindSession(run.id, claim.leaseToken, original.id), true);
+      assert.equal(await runs.bindSession(run.id, claim.leaseToken, original.id), true);
+      assert.equal((await identity.ensure({ id: original.id, scopeId: scope })).authority?.actor.id, "alice");
+      assert.equal(await sessions.deleteSessionIfEmpty(original.id), true);
+      const replacement = await sessions.getOrCreateByThread(threadRef, "group", scope);
+      assert.notEqual(replacement.id, original.id);
+      assert.equal(await runs.bindSession(run.id, claim.leaseToken, replacement.id), false);
+      assert.equal((await identity.ensure({ id: replacement.id, scopeId: scope })).authority, null);
+      await runs.complete(run.id, claim.leaseToken, { status: "ok", sessionId: original.id });
+      assert.equal(await runs.bindSession(run.id, claim.leaseToken, original.id), false);
+      assert.equal((await identity.ensure({ id: replacement.id, scopeId: scope })).authority, null);
+      const next = await runs.enqueue({
+        sessionId: threadRef,
+        request: { ...request, actor: { id: "bob", type: "internal" } },
+      });
+      const nextClaim = await runs.claimById(next.run.id, "worker", 30_000);
+      assert.ok(nextClaim?.leaseToken);
+      assert.equal(await runs.bindSession(next.run.id, nextClaim.leaseToken, replacement.id), true);
+      assert.equal((await identity.ensure({ id: replacement.id, scopeId: scope })).authority?.actor.id, "bob");
+      assert.equal((await repository.get("peer", original.id))?.authority?.actor.id, "alice");
+      const legacy = await runs.enqueue({ sessionId: `legacy:${threadRef}`, request });
+      const legacyClaim = await runs.claimById(legacy.run.id, "worker", 30_000);
+      assert.ok(legacyClaim?.leaseToken);
+      assert.equal(await runs.releaseLease(legacy.run.id, legacyClaim.leaseToken), true);
+      const retry = await runs.claimById(legacy.run.id, "worker", 30_000);
+      assert.ok(retry?.leaseToken);
+      assert.equal(retry.attempts, 2);
+      assert.equal(await runs.bindSession(legacy.run.id, retry.leaseToken, replacement.id), false);
     },
   );
 }
@@ -108,7 +167,11 @@ for (const mismatch of ["thread", "kind", "scope", "unexecuted"] as const) {
       text: "Old task",
     };
     const { run } = await runs.enqueue({ sessionId: session.threadRef, request });
-    if (mismatch !== "unexecuted") assert.ok(await runs.claimById(run.id, "worker", 30_000));
+    if (mismatch !== "unexecuted") {
+      const claim = await runs.claimById(run.id, "worker", 30_000);
+      assert.ok(claim?.leaseToken);
+      assert.equal(await runs.bindSession(run.id, claim.leaseToken, session.id), true);
+    }
     const identity = createPeerIdentity(repository, { sessions, runs });
     const peer = await identity.ensure({ id: session.id, scopeId: scope, authority: { ...request, surface: "web" } });
     assert.equal(peer.authority, null);

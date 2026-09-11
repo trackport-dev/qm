@@ -20,7 +20,7 @@ export interface ProcessDeps {
 }
 
 export interface RunExecutionAdmission {
-  admit(run: Run): Promise<"admitted" | "concurrency_limit" | "turn_limit" | "attempt_busy">;
+  admit(run: Run): Promise<"admitted" | "concurrency_limit" | "turn_limit" | "attempt_busy" | "coordination_paused">;
   release(run: Run): Promise<void>;
 }
 
@@ -65,6 +65,7 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
     clearInterval(beat);
   };
   let admitted = false;
+  let executionClosed = false;
   const pendingExecutions = new Set<Promise<void>>();
   try {
     const admission = (await deps.execution?.admit(run)) ?? "admitted";
@@ -81,9 +82,23 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
       origin: resolveTurnOrigin(run.request),
       runId: run.id,
       attempt: run.attempts,
+      runLeaseToken: token,
       finalAttempt: errorParks(run, deps.runs.maxClaims),
       background: opts?.background ?? false,
       cancel: cancel.signal,
+      async authorizeToolExecution() {
+        if (executionClosed || cancel.signal.aborted) throw new Error("run attempt no longer accepts tool execution");
+        const current = await deps.runs.get(run.id);
+        if (
+          executionClosed ||
+          cancel.signal.aborted ||
+          current?.status !== "running" ||
+          current.leaseToken !== token ||
+          current.leaseExpiresAt === null ||
+          current.leaseExpiresAt <= Date.now()
+        )
+          throw new Error("run attempt no longer accepts tool execution");
+      },
       onExecutionPending(operation) {
         const settled = operation.then(
           () => {},
@@ -95,12 +110,14 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
       ...(queueMs !== undefined ? { queueMs } : {}),
       ...(run.startedAt !== null ? { runStartedAt: run.startedAt } : {}),
     });
+    executionClosed = true;
     stopBeat();
     if (!(await deps.runs.complete(run.id, token, result))) {
       throw new Error(`run ${run.id} lost its lease before completion`);
     }
     return result;
   } catch (err) {
+    executionClosed = true;
     stopBeat();
     console.error(`[worker] run ${run.id} turn failed: ${errMessage(err)}`);
     if (!errorAlreadyRecorded(err))
@@ -115,6 +132,7 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
     });
     throw err;
   } finally {
+    executionClosed = true;
     stopBeat();
     if (admitted && deps.execution) {
       const release = () =>
@@ -151,7 +169,7 @@ export function createWorker(deps: WorkerDeps): Worker {
   const pollMs = deps.pollMs ?? 50;
   let stopped = false;
   let loopDone: Promise<void> | null = null;
-  let inFlight: { runId: string; leaseToken: string; threadRef: string } | null = null;
+  let inFlight: { runId: string; leaseToken: string } | null = null;
   let releasedLeaseToken: string | null = null;
   let releasing: Promise<void> | null = null;
 
@@ -184,8 +202,7 @@ export function createWorker(deps: WorkerDeps): Worker {
             .catch((e) => swallow("worker: post-stop claim handback failed", e));
         break;
       }
-      inFlight =
-        run.leaseToken !== null ? { runId: run.id, leaseToken: run.leaseToken, threadRef: run.sessionId } : null;
+      inFlight = run.leaseToken !== null ? { runId: run.id, leaseToken: run.leaseToken } : null;
       deps.onClaimed?.();
       try {
         await processRun(deps, run, { background: true });
@@ -213,8 +230,10 @@ export function createWorker(deps: WorkerDeps): Worker {
       releasing = (async () => {
         try {
           if (await deps.runs.heartbeat(held.runId, held.leaseToken, deps.leaseTtlMs)) {
-            const session = await deps.sessions.getByThread(held.threadRef);
-            if (session) await deps.sessions.forceReleaseLease(session.id);
+            const run = await deps.runs.get(held.runId);
+            const boundId = run?.sessionRecordId ?? run?.result?.sessionId;
+            if (boundId && run?.status === "running" && run.leaseToken === held.leaseToken)
+              await deps.sessions.forceReleaseLease(boundId, { runId: held.runId, runLeaseToken: held.leaseToken });
             await deps.runs.releaseLease(held.runId, held.leaseToken);
           }
           releasedLeaseToken = held.leaseToken;

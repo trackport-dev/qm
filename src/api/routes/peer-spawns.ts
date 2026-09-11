@@ -1,5 +1,5 @@
 import { CoordinationError, publicPeer } from "../../coordination/types.ts";
-import { ownPeerSession, peerActor, peerRoute } from "./peers.ts";
+import { ownPeerSession, peerActor, peerRoute, peerRunFence } from "./peers.ts";
 import { isObj } from "./shared.ts";
 import type { ApiCtx, Route } from "./route.ts";
 
@@ -10,6 +10,27 @@ function spawning(ctx: ApiCtx) {
 
 export const peerSpawnRoutes: ReadonlyArray<Route<ApiCtx>> = [
   {
+    method: "PUT",
+    path: "/v1/peers/:id/execution-limits",
+    auth: "either",
+    handle: peerRoute(async (ctx) => {
+      const id = await ownPeerSession(ctx);
+      if (id !== ctx.params.id) throw new CoordinationError(403, "forbidden", "agents may lower only their own limits");
+      if (!ctx.deps.peerExecution)
+        throw new CoordinationError(404, "coordination_disabled", "coordination is disabled");
+      if (!isObj(ctx.body) || typeof ctx.body.concurrencyLimit !== "number" || typeof ctx.body.turnLimit !== "number")
+        throw new CoordinationError(400, "bad_request", "provide numeric concurrencyLimit and turnLimit");
+      return {
+        execution: await ctx.deps.peerExecution.lowerLimits(
+          id,
+          ctx.body.concurrencyLimit,
+          ctx.body.turnLimit,
+          peerRunFence(ctx, id),
+        ),
+      };
+    }),
+  },
+  {
     method: "POST",
     path: "/v1/peer-spawns",
     auth: "either",
@@ -19,17 +40,25 @@ export const peerSpawnRoutes: ReadonlyArray<Route<ApiCtx>> = [
       if (typeof body.task !== "string" || typeof body.name !== "string" || typeof body.idempotencyKey !== "string")
         throw new CoordinationError(400, "bad_request", "provide task, name and idempotencyKey");
       const backend = ctx.deps.peerSpawnBackend;
-      if (!backend) throw new CoordinationError(503, "spawn_backend_unavailable", "spawn backend is unavailable");
+      if (!backend)
+        throw new CoordinationError(
+          503,
+          "spawn_backend_unavailable",
+          "spawning requires enabled sandbox-resource management",
+        );
       await ctx.deps.peerIdentity!.ensure({ id: parentId, scopeId: ctx.capability!.scopeId });
-      const operation = await spawning(ctx).reserve({
-        parentId,
-        parentRunId: ctx.capability!.runId!,
-        backend,
-        task: body.task,
-        name: body.name,
-        character: body.character,
-        idempotencyKey: body.idempotencyKey,
-      });
+      const operation = await spawning(ctx).reserve(
+        {
+          parentId,
+          parentRunId: ctx.capability!.runId!,
+          backend,
+          task: body.task,
+          name: body.name,
+          character: body.character,
+          idempotencyKey: body.idempotencyKey,
+        },
+        peerRunFence(ctx, parentId),
+      );
       return {
         spawn: {
           id: operation.id,
@@ -45,23 +74,28 @@ export const peerSpawnRoutes: ReadonlyArray<Route<ApiCtx>> = [
     method: "GET",
     path: "/v1/peers/:id/subtree",
     auth: "either",
-    handle: peerRoute(async (ctx) => {
-      const result = await spawning(ctx).inspect(ctx.params.id!);
-      const actor = await peerActor(ctx);
-      return {
-        peer: publicPeer(result.peer),
-        count: result.count,
-        cap: result.cap,
-        ...(ctx.deps.peerExecution ? { execution: await ctx.deps.peerExecution.usage(result.peer.id) } : {}),
-        manageable: !ctx.capability && (await ctx.app.managesScope(actor, result.peer.scopeId)),
-        nodes: await Promise.all(
-          (await spawning(ctx).tree(ctx.params.id!)).map(async (node) => ({
-            ...node,
-            ...((await ctx.app.getSessionForViewer(node.peer.id, actor)) ? { sessionId: node.peer.id } : {}),
-          })),
-        ),
-      };
-    }),
+    handle: peerRoute(
+      async (ctx) => {
+        const inspector = ctx.deps.peerInspection?.spawning ?? spawning(ctx);
+        const result = await inspector.inspect(ctx.params.id!);
+        const actor = await peerActor(ctx);
+        return {
+          peer: publicPeer(result.peer),
+          count: result.count,
+          cap: result.cap,
+          ...(ctx.deps.peerExecution ? { execution: await ctx.deps.peerExecution.usage(result.peer.id) } : {}),
+          manageable:
+            !!ctx.deps.peerLifecycle && !ctx.capability && (await ctx.app.managesScope(actor, result.peer.scopeId)),
+          nodes: await Promise.all(
+            (await inspector.tree(ctx.params.id!)).map(async (node) => ({
+              ...node,
+              ...((await ctx.app.getSessionForViewer(node.peer.id, actor)) ? { sessionId: node.peer.id } : {}),
+            })),
+          ),
+        };
+      },
+      { inspection: true },
+    ),
   },
   {
     method: "POST",
@@ -96,7 +130,7 @@ export const peerSpawnRoutes: ReadonlyArray<Route<ApiCtx>> = [
       if (id !== ctx.params.id) throw new CoordinationError(403, "forbidden", "agents may lower only their own limit");
       if (!isObj(ctx.body) || typeof ctx.body.limit !== "number")
         throw new CoordinationError(400, "bad_request", "provide a numeric limit");
-      return spawning(ctx).lowerLimit(id, ctx.body.limit);
+      return spawning(ctx).lowerLimit(id, ctx.body.limit, peerRunFence(ctx, id));
     }),
   },
 ];

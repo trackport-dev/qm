@@ -383,6 +383,7 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
   const sandbox: Sandbox = {
     profile,
     startProcess: procSessions.startProcess,
+    startRegisteredProcess: procSessions.startRegisteredProcess,
     readProcess: procSessions.readProcess,
     writeStdin: procSessions.writeStdin,
     signalProcess: procSessions.signalProcess,

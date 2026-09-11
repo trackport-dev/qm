@@ -38,6 +38,16 @@ async function harness(readOutputTail: ReadOutputTail = async () => ({ outputTai
   return { store, registry, broker, rec };
 }
 
+test("watch does not mistake an unconfirmed launch for a completed job", async () => {
+  const { broker, store, registry } = await harness(async () => {
+    throw new Error("must not probe an unconfirmed launch");
+  });
+  await registry.markStatus("p-1", "starting");
+  await assert.rejects(broker.watch("p-1"), /launch is unconfirmed/);
+  assert.equal((await store.list()).length, 0);
+  assert.equal((await registry.get("p-1"))?.status, "starting");
+});
+
 test("watch arms a monitor inheriting the turn's owner, scope, thread, and destination", async () => {
   const { broker, store, rec } = await harness();
   const r = armed(await broker.watch("p-1", { instructions: "summarize failures", pattern: "FAIL", sinceCursor: 7 }));

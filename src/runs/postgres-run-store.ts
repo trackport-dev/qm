@@ -25,6 +25,7 @@ function rowToRun(r: Record<string, unknown>): Run {
   return {
     id: r.id as string,
     sessionId: r.session_id as string,
+    sessionRecordId: (r.session_record_id as string | null) ?? null,
     status: r.status as Run["status"],
     request: { ...request, origin: resolveTurnOrigin(request) },
     result: r.result != null ? (JSON.parse(r.result as string) as TurnResult) : null,
@@ -108,6 +109,13 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
           `CREATE INDEX IF NOT EXISTS idx_runs_first_internal_execution_v1
            ON runs(session_id, started_at, created_at, seq)
            WHERE started_at IS NOT NULL AND request::jsonb->'actor'->>'type'='internal'`,
+        ],
+      },
+      {
+        id: "runs/store/0006-session-incarnation",
+        statements: [
+          `SET LOCAL lock_timeout = '3s'`,
+          `ALTER TABLE runs ADD COLUMN IF NOT EXISTS session_record_id TEXT`,
         ],
       },
     ],
@@ -345,12 +353,25 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
       return rows.map(rowToRun);
     },
 
-    async firstExecutedForThread(sessionId): Promise<Run | null> {
+    async bindSession(runId, leaseToken, sessionRecordId) {
+      const { rowCount } = await q(
+        `UPDATE runs SET session_record_id=$3 WHERE id=$1 AND lease_token=$2
+         AND status='running' AND lease_expires_at>$4
+         AND (session_record_id=$3 OR (session_record_id IS NULL
+           AND (attempts=1 OR result::jsonb->>'sessionId'=$3)
+           AND (result::jsonb->>'sessionId' IS NULL OR result::jsonb->>'sessionId'=$3)))`,
+        [runId, leaseToken, sessionRecordId, Date.now()],
+      );
+      return rowCount > 0;
+    },
+
+    async firstExecutedForSession(sessionId, sessionRecordId): Promise<Run | null> {
       const { rows } = await q(
         `SELECT * FROM runs WHERE session_id=$1 AND started_at IS NOT NULL
          AND request::jsonb->'actor'->>'type'='internal'
+         AND COALESCE(session_record_id, result::jsonb->>'sessionId')=$2
          ORDER BY started_at, created_at, seq LIMIT 1`,
-        [sessionId],
+        [sessionId, sessionRecordId],
       );
       return rows[0] ? rowToRun(rows[0]) : null;
     },
@@ -371,7 +392,7 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
     },
 
     async reapExpired(
-      onRetired?: (sessionIds: string[]) => Promise<void>,
+      onRetired?: Parameters<RunStore["reapExpired"]>[0],
       opts?: { maxAgeMs?: number; onReap?: (event: ReapEvent) => void },
     ): Promise<{ requeued: number; parked: number }> {
       const now = Date.now();
@@ -391,7 +412,12 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
           [fenceToken, run.id, run.leaseToken, now, now + FENCE_HOLD_MS],
         );
         if (!fenced.rows[0]) continue;
-        if (onRetired) await onRetired([run.sessionId]);
+        const boundId = run.sessionRecordId ?? run.result?.sessionId;
+        if (onRetired)
+          await onRetired(
+            [run.sessionId],
+            boundId && run.leaseToken ? [{ sessionId: boundId, runId: run.id, runLeaseToken: run.leaseToken }] : [],
+          );
         const r = await retire({ ...run, leaseToken: fenceToken }, reason, !tooOld);
         if (!r.applied) continue;
         if (r.requeued) requeued++;

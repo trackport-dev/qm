@@ -68,7 +68,7 @@ test("Codex replay keeps paired tool ids within the provider's 64-character limi
   assert.equal(codexReplayCallId("short-id"), "short-id");
 });
 
-function fakeCodexBinary(dir: string): string {
+function fakeCodexBinary(dir: string, nativeSubagents = true): string {
   const path = join(dir, "fake-codex");
   writeFileSync(
     path,
@@ -84,6 +84,7 @@ rl.on("line", (line) => {
     if (msg.params.sandbox !== "read-only" || msg.params.approvalPolicy !== "never" || !Array.isArray(msg.params.dynamicTools) ||
         !Array.isArray(msg.params.environments) || msg.params.environments.length !== 0 ||
         msg.params.config?.features?.shell_tool !== false || msg.params.config?.features?.unified_exec !== false ||
+        msg.params.config?.features?.multi_agent !== ${JSON.stringify(nativeSubagents)} ||
         process.env.CORE_SIGNING_SECRET || process.env.DATABASE_URL || process.env.HOME !== msg.params.cwd ||
         !process.env.CODEX_HOME?.startsWith(msg.params.cwd)) {
       return send({ id: msg.id, error: { code: -1, message: "unsafe or missing adapter settings" } });
@@ -450,54 +451,66 @@ test("Codex forwards tool-result screening into its native tool bridge", () => {
   assert.equal(ref.screenToolResult, screenToolResult);
 });
 
-test("Codex harness drives app-server JSON-RPC with a read-only jail", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-codex-test-"));
-  const tasks = createMemoryTaskStore();
-  const harness = createCodexHarness({ binaryPath: fakeCodexBinary(dir), env: testHarnessEnv(dir), tasks });
-  t.after(async () => {
-    await harness.turns.close?.();
-    rmSync(dir, { recursive: true, force: true });
-  });
-  const entries: SessionEntry[] = [];
-  const deltas: string[] = [];
-  const modelCalls: number[] = [];
-  const scope = { kind: "org", id: "test" } as unknown as ScopeId;
-  const session = { id: "session-1" } as Session;
-  const operations: Promise<void>[] = [];
-  const result = await harness.turns.runTurn({
-    onExecutionPending(operation) {
-      operations.push(operation);
-    },
-    session,
-    input: "hi",
-    systemPrompt: "be concise",
-    history: [],
-    tools: {} as HarnessTurnInput["tools"],
-    scopeLabel: scope,
-    orgScopeId: scope,
-    emit: async (entry) => {
-      const saved = { ...entry, sessionId: session.id, seq: entries.length + 1, createdAt: Date.now() } as SessionEntry;
-      entries.push(saved);
-      return saved;
-    },
-    recordModelCall: ({ inputTokens }) => modelCalls.push(inputTokens),
-    onDelta: (delta) => deltas.push(delta),
-  });
+for (const nativeSubagents of [true, false]) {
+  test(`Codex harness drives app-server JSON-RPC with a read-only jail (native delegation=${nativeSubagents})`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "qm-codex-test-"));
+    const tasks = createMemoryTaskStore();
+    const harness = createCodexHarness({
+      binaryPath: fakeCodexBinary(dir, nativeSubagents),
+      env: testHarnessEnv(dir),
+      tasks,
+      nativeSubagents,
+    });
+    t.after(async () => {
+      await harness.turns.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const entries: SessionEntry[] = [];
+    const deltas: string[] = [];
+    const modelCalls: number[] = [];
+    const scope = { kind: "org", id: "test" } as unknown as ScopeId;
+    const session = { id: "session-1" } as Session;
+    const operations: Promise<void>[] = [];
+    const result = await harness.turns.runTurn({
+      onExecutionPending(operation) {
+        operations.push(operation);
+      },
+      session,
+      input: "hi",
+      systemPrompt: "be concise",
+      history: [],
+      tools: {} as HarnessTurnInput["tools"],
+      scopeLabel: scope,
+      orgScopeId: scope,
+      emit: async (entry) => {
+        const saved = {
+          ...entry,
+          sessionId: session.id,
+          seq: entries.length + 1,
+          createdAt: Date.now(),
+        } as SessionEntry;
+        entries.push(saved);
+        return saved;
+      },
+      recordModelCall: ({ inputTokens }) => modelCalls.push(inputTokens),
+      onDelta: (delta) => deltas.push(delta),
+    });
 
-  assert.equal(result.reply, "hello");
-  assert.equal(operations.length, 1);
-  await Promise.all(operations);
-  assert.deepEqual(deltas, ["hello"]);
-  assert.deepEqual(modelCalls, [100, 70, 150]);
-  assert.deepEqual(
-    entries.map((entry) => entry.type),
-    ["user", "tool_call", "tool_result", "assistant"],
-  );
-  assert.deepEqual(
-    (await tasks.list()).map(({ title, status }) => ({ title, status })),
-    [{ title: "return ALPHA", status: "completed" }],
-  );
-});
+    assert.equal(result.reply, "hello");
+    assert.equal(operations.length, 1);
+    await Promise.all(operations);
+    assert.deepEqual(deltas, ["hello"]);
+    assert.deepEqual(modelCalls, [100, 70, 150]);
+    assert.deepEqual(
+      entries.map((entry) => entry.type),
+      ["user", "tool_call", "tool_result", "assistant"],
+    );
+    assert.deepEqual(
+      (await tasks.list()).map(({ title, status }) => ({ title, status })),
+      [{ title: "return ALPHA", status: "completed" }],
+    );
+  });
+}
 
 test("Codex task titles stay concise when the provider includes the parent request", () => {
   assert.equal(

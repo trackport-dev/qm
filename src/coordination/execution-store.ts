@@ -1,7 +1,10 @@
 import { createKeyedQueue } from "../util/async.ts";
-import { withPgTransaction, type PgPool } from "../persistence/pg-pool.ts";
+import { withPgTransaction, type PgPool, type PoolClient } from "../persistence/pg-pool.ts";
+import { CoordinationError } from "./types.ts";
+import { assertRunFence, withFencedPgTransaction, type CoordinationRunFence } from "./run-fence.ts";
+import type { RunStore } from "../runs/run-store.ts";
 
-export interface PeerExecution {
+interface PeerExecution {
   runId: string;
   rootId: string;
   scopeId: string;
@@ -11,7 +14,7 @@ export interface PeerExecution {
   orphaned: boolean;
 }
 type ExecutionInput = Omit<PeerExecution, "active" | "orphaned">;
-export type ExecutionAdmission = "admitted" | "concurrency_limit" | "turn_limit" | "attempt_busy";
+type ExecutionAdmission = "admitted" | "concurrency_limit" | "turn_limit" | "attempt_busy";
 export interface ExecutionUsage {
   activeInScope: number;
   orphanedInScope: number;
@@ -20,6 +23,13 @@ export interface ExecutionUsage {
   turnLimit: number;
 }
 export interface PeerExecutionStore {
+  lowerLimits(
+    rootId: string,
+    scopeId: string,
+    concurrencyLimit: number,
+    turnLimit: number,
+    fence?: CoordinationRunFence,
+  ): Promise<void>;
   recordStart(runId: string, attempt: number): Promise<void>;
   recordRelease(runId: string, attempt: number, token: string | null): Promise<void>;
   wasTokenReleased(runId: string, token: string): Promise<boolean>;
@@ -44,13 +54,50 @@ function validateLimits(concurrency: number, turnLimit: number): void {
     throw new Error("execution limits must be positive integers");
 }
 
-export function createMemoryPeerExecutionStore(concurrency = 4, turnLimit = 200): PeerExecutionStore {
+function validateLowerLimits(concurrency: number, turns: number, usage: ExecutionUsage): void {
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1 || !Number.isSafeInteger(turns) || turns < 1)
+    throw new CoordinationError(400, "invalid_execution_limits", "execution limits must be positive integers");
+  if (concurrency > usage.concurrencyLimit || turns > usage.turnLimit)
+    throw new CoordinationError(409, "execution_limit_increase", "agents may only lower execution limits");
+  if (concurrency < usage.activeInScope || turns < usage.autonomousTurns)
+    throw new CoordinationError(
+      409,
+      "execution_limit_below_usage",
+      "execution limits cannot be lower than current usage",
+    );
+}
+
+export function createMemoryPeerExecutionStore(
+  concurrency = 4,
+  turnLimit = 200,
+  runs?: Pick<RunStore, "get">,
+): PeerExecutionStore {
   validateLimits(concurrency, turnLimit);
   const rows = new Map<string, PeerExecution>();
   const released = new Map<string, Map<number, boolean>>();
   const releasedTokens = new Set<string>();
   const queue = createKeyedQueue();
+  const scopeLimits = new Map<string, number>();
+  const rootLimits = new Map<string, number>();
+  function usage(rootId: string, scopeId: string): ExecutionUsage {
+    const values = [...rows.values()];
+    return {
+      activeInScope: values.filter((row) => row.active && row.scopeId === scopeId).length,
+      orphanedInScope: values.filter((row) => row.active && row.orphaned && row.scopeId === scopeId).length,
+      autonomousTurns: values.filter((row) => row.autonomous && row.rootId === rootId).length,
+      concurrencyLimit: scopeLimits.get(scopeId) ?? concurrency,
+      turnLimit: rootLimits.get(rootId) ?? turnLimit,
+    };
+  }
   return {
+    lowerLimits: (rootId, scopeId, nextConcurrency, nextTurns, fence) =>
+      queue("admission", async () => {
+        const run = fence ? ((await runs?.get(fence.runId)) ?? null) : null;
+        if (fence) assertRunFence(fence, run);
+        validateLowerLimits(nextConcurrency, nextTurns, usage(rootId, scopeId));
+        scopeLimits.set(scopeId, nextConcurrency);
+        rootLimits.set(rootId, nextTurns);
+      }),
     async recordStart(runId, attempt) {
       const attempts = released.get(runId) ?? new Map<number, boolean>();
       if (!attempts.has(attempt)) attempts.set(attempt, false);
@@ -70,29 +117,16 @@ export function createMemoryPeerExecutionStore(concurrency = 4, turnLimit = 200)
       return attempts?.get(attempt) === true && [...attempts.values()].every(Boolean);
     },
     async usage(rootId, scopeId) {
-      const values = [...rows.values()];
-      return {
-        activeInScope: values.filter((row) => row.active && row.scopeId === scopeId).length,
-        orphanedInScope: values.filter((row) => row.active && row.orphaned && row.scopeId === scopeId).length,
-        autonomousTurns: values.filter((row) => row.autonomous && row.rootId === rootId).length,
-        concurrencyLimit: concurrency,
-        turnLimit,
-      };
+      return usage(rootId, scopeId);
     },
     admit: (input) =>
       queue("admission", async () => {
         const existing = rows.get(input.runId);
         checkBinding(existing, input);
         if (existing?.active) return existing.token === input.token && !existing.orphaned ? "admitted" : "attempt_busy";
-        const values = [...rows.values()];
-        if (values.filter((row) => row.active && row.scopeId === input.scopeId).length >= concurrency)
-          return "concurrency_limit";
-        if (
-          !existing &&
-          input.autonomous &&
-          values.filter((row) => row.autonomous && row.rootId === input.rootId).length >= turnLimit
-        )
-          return "turn_limit";
+        const current = usage(input.rootId, input.scopeId);
+        if (current.activeInScope >= current.concurrencyLimit) return "concurrency_limit";
+        if (!existing && input.autonomous && current.autonomousTurns >= current.turnLimit) return "turn_limit";
         rows.set(input.runId, { ...input, active: true, orphaned: false });
         return "admitted";
       }),
@@ -128,6 +162,7 @@ export function createPostgresPeerExecutionStore(
   orgId: string,
   concurrency = 4,
   turnLimit = 200,
+  memoryRuns?: () => RunStore,
 ): PeerExecutionStore {
   validateLimits(concurrency, turnLimit);
   if (!orgId) throw new Error("execution admission requires an organization");
@@ -171,6 +206,15 @@ export function createPostgresPeerExecutionStore(
     ],
   };
   pg.registerMigration(tokenMigration);
+  const limitsMigration = {
+    id: "coordination/0015-lowered-execution-limits",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS coordination_execution_limits (
+        org_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('scope','root')), id TEXT NOT NULL,
+        ceiling BIGINT NOT NULL CHECK (ceiling > 0), PRIMARY KEY (org_id,kind,id))`,
+    ],
+  };
+  pg.registerMigration(limitsMigration);
   const ready = async () => {
     await pg.migrate(migration);
     await pg.migrate(budgetMigration);
@@ -178,8 +222,61 @@ export function createPostgresPeerExecutionStore(
     await pg.migrate(releaseMigration);
     await pg.migrate(startedMigration);
     await pg.migrate(tokenMigration);
+    await pg.migrate(limitsMigration);
   };
+  async function currentUsage(client: PoolClient, rootId: string, scopeId: string): Promise<ExecutionUsage> {
+    const { rows } = await client.query(
+      `SELECT
+        count(*) FILTER (WHERE active AND scope_id=$3)::int AS active,
+        count(*) FILTER (WHERE active AND orphaned AND scope_id=$3)::int AS orphaned,
+        count(*) FILTER (WHERE autonomous AND root_id=$2)::int AS turns
+        FROM coordination_executions WHERE org_id=$1 AND (root_id=$2 OR (scope_id=$3 AND active))`,
+      [orgId, rootId, scopeId],
+    );
+    const limits = await client.query(
+      "SELECT kind,ceiling FROM coordination_execution_limits WHERE org_id=$1 AND ((kind='root' AND id=$2) OR (kind='scope' AND id=$3))",
+      [orgId, rootId, scopeId],
+    );
+    return {
+      activeInScope: rows[0].active,
+      orphanedInScope: rows[0].orphaned,
+      autonomousTurns: rows[0].turns,
+      concurrencyLimit: Math.min(
+        concurrency,
+        Number(limits.rows.find((row) => row.kind === "scope")?.ceiling ?? concurrency),
+      ),
+      turnLimit: Math.min(turnLimit, Number(limits.rows.find((row) => row.kind === "root")?.ceiling ?? turnLimit)),
+    };
+  }
+  async function lockAdmission(client: PoolClient, keys: string[]): Promise<void> {
+    await client.query("SET LOCAL lock_timeout='10s'");
+    await client.query("SET LOCAL statement_timeout='15s'");
+    for (const key of keys.sort())
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        JSON.stringify(["peer-execution", orgId, key]),
+      ]);
+  }
   return {
+    async lowerLimits(rootId, scopeId, nextConcurrency, nextTurns, fence) {
+      await ready();
+      await withFencedPgTransaction(
+        pg,
+        async (client) => {
+          await lockAdmission(client, [`root:${rootId}`, `scope:${scopeId}`]);
+          validateLowerLimits(nextConcurrency, nextTurns, await currentUsage(client, rootId, scopeId));
+          for (const [kind, id, ceiling] of [
+            ["scope", scopeId, nextConcurrency],
+            ["root", rootId, nextTurns],
+          ])
+            await client.query(
+              "INSERT INTO coordination_execution_limits(org_id,kind,id,ceiling) VALUES($1,$2,$3,$4) ON CONFLICT(org_id,kind,id) DO UPDATE SET ceiling=EXCLUDED.ceiling",
+              [orgId, kind, id, ceiling],
+            );
+        },
+        fence,
+        memoryRuns,
+      );
+    },
     async recordStart(runId, attempt) {
       await ready();
       await pg.q(
@@ -219,31 +316,12 @@ export function createPostgresPeerExecutionStore(
     },
     async usage(rootId, scopeId) {
       await ready();
-      const rows = await pg.q(
-        `SELECT
-        count(*) FILTER (WHERE active AND scope_id=$3)::int AS active,
-        count(*) FILTER (WHERE active AND orphaned AND scope_id=$3)::int AS orphaned,
-        count(*) FILTER (WHERE autonomous AND root_id=$2)::int AS turns
-        FROM coordination_executions WHERE org_id=$1 AND (root_id=$2 OR (scope_id=$3 AND active))`,
-        [orgId, rootId, scopeId],
-      );
-      return {
-        activeInScope: rows[0]!.active as number,
-        orphanedInScope: rows[0]!.orphaned as number,
-        autonomousTurns: rows[0]!.turns as number,
-        concurrencyLimit: concurrency,
-        turnLimit,
-      };
+      return withPgTransaction(await pg.pool(), (client) => currentUsage(client, rootId, scopeId));
     },
     async admit(input) {
       await ready();
       return withPgTransaction(await pg.pool(), async (client) => {
-        await client.query("SET LOCAL lock_timeout='10s'");
-        await client.query("SET LOCAL statement_timeout='15s'");
-        for (const key of [`run:${input.runId}`, `root:${input.rootId}`, `scope:${input.scopeId}`].sort())
-          await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-            JSON.stringify(["peer-execution", orgId, key]),
-          ]);
+        await lockAdmission(client, [`run:${input.runId}`, `root:${input.rootId}`, `scope:${input.scopeId}`]);
         const { rows } = await client.query(
           "SELECT root_id, scope_id, token, active, autonomous, orphaned FROM coordination_executions WHERE org_id=$1 AND run_id=$2",
           [orgId, input.runId],
@@ -262,17 +340,10 @@ export function createPostgresPeerExecutionStore(
           input,
         );
         if (existing?.active) return existing.token === input.token && !existing.orphaned ? "admitted" : "attempt_busy";
-        const running = await client.query(
-          "SELECT count(*)::int AS count FROM coordination_executions WHERE org_id=$1 AND scope_id=$2 AND active",
-          [orgId, input.scopeId],
-        );
-        if (running.rows[0].count >= concurrency) return "concurrency_limit";
+        const current = await currentUsage(client, input.rootId, input.scopeId);
+        if (current.activeInScope >= current.concurrencyLimit) return "concurrency_limit";
         if (!existing && input.autonomous) {
-          const used = await client.query(
-            "SELECT count(*)::int AS count FROM coordination_executions WHERE org_id=$1 AND root_id=$2 AND autonomous",
-            [orgId, input.rootId],
-          );
-          if (used.rows[0].count >= turnLimit) return "turn_limit";
+          if (current.autonomousTurns >= current.turnLimit) return "turn_limit";
         }
         await client.query(
           `INSERT INTO coordination_executions(org_id,run_id,root_id,scope_id,token,active,autonomous)

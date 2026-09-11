@@ -75,6 +75,11 @@ export interface Lease {
   token: string;
 }
 
+export interface SessionLeaseOwner {
+  runId: string;
+  runLeaseToken: string;
+}
+
 export type LeaseHolder = "turn" | "compaction" | "fork" | "backfill";
 
 export interface LeaseAttempt {
@@ -90,6 +95,7 @@ export interface LeasePeek {
 }
 
 export interface AcquireLeaseWaitOptions {
+  owner?: SessionLeaseOwner;
   waitFor?: (heldBy: LeaseHolder | undefined) => boolean;
 }
 
@@ -108,7 +114,7 @@ export async function acquireLeaseWithin(
   let delay = LEASE_WAIT_MIN_DELAY_MS;
   for (;;) {
     const waitedMs = Date.now() - started;
-    const attempt = await sessions.acquireLease(sessionId, holder);
+    const attempt = await sessions.acquireLease(sessionId, holder, opts?.owner);
     if (attempt.lease) return { ...attempt, waitedMs };
     if (attempt.heldUntil === undefined) return { ...attempt, waitedMs };
     if (opts?.waitFor && !opts.waitFor(attempt.heldBy)) return { ...attempt, waitedMs };
@@ -674,11 +680,11 @@ export interface SessionStore {
   ): Promise<void>;
 
   readonly leaseTtlMs: number;
-  acquireLease(sessionId: string, holder?: LeaseHolder): Promise<LeaseAttempt>;
+  acquireLease(sessionId: string, holder?: LeaseHolder, owner?: SessionLeaseOwner): Promise<LeaseAttempt>;
   peekLease(sessionId: string): Promise<LeasePeek | null>;
   renewLease(lease: Lease): Promise<boolean>;
   releaseLease(lease: Lease): Promise<void>;
-  forceReleaseLease(sessionId: string): Promise<void>;
+  forceReleaseLease(sessionId: string, owner?: SessionLeaseOwner): Promise<void>;
 
   append(lease: Lease, entry: NewEntry): Promise<SessionEntry>;
   getEntries(sessionId: string, opts?: GetEntriesOptions): Promise<SessionEntry[]>;
@@ -702,6 +708,8 @@ export interface SessionStore {
   getForParticipant(sessionId: string, principalId: string): Promise<Session | null>;
 
   deleteSession(sessionId: string): Promise<void>;
+  withSessionLocks?<T>(sessionIds: readonly string[], action: () => Promise<T>): Promise<T>;
+  wasDeleted(sessionId: string): Promise<boolean>;
   deleteSessionIfEmpty(sessionId: string): Promise<boolean>;
 
   updateParticipantView(sessionId: string, principalId: string, patch: ParticipantViewPatch): Promise<void>;

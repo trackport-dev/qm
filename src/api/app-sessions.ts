@@ -462,7 +462,13 @@ export function createSessionMethods(
       const jobs = ((await deps.processes?.listLive(now)) ?? [])
         .filter((r) => r.kind === "background" && r.sessionRef === session.threadRef)
         .sort((a, b) => b.startedAt - a.startedAt)
-        .map((r) => ({ processId: r.processId, command: r.command, startedAt: r.startedAt, expiresAt: r.expiresAt }));
+        .map((r) => ({
+          processId: r.processId,
+          command: r.command,
+          startedAt: r.startedAt,
+          expiresAt: r.expiresAt,
+          ...(r.status === "starting" ? { launchUnconfirmed: true } : {}),
+        }));
       const watches = ((await deps.monitors?.enabled()) ?? [])
         .filter((m) => m.threadRef === session.threadRef && m.expiresAt > now)
         .sort((a, b) => b.createdAt - a.createdAt)
@@ -493,6 +499,7 @@ export function createSessionMethods(
       const sandbox = deps.sandbox;
       const rec = await deps.processes.get(processId);
       if (!rec || rec.kind !== "background" || rec.sessionRef !== session.threadRef) return null;
+      if (rec.status === "starting") return { chunk: "", cursor: sinceCursor, state: "starting" };
       const handle = await sandbox.provision(
         [{ scopeId: rec.scopeId, mode: "rw", mountPath: "" }],
         rec.sandboxId ? { sandboxId: rec.sandboxId } : undefined,

@@ -198,7 +198,13 @@ export async function loadInheritedTranscript(
 }
 
 export interface SessionBackgroundView {
-  jobs: Array<{ processId: string; command: string; startedAt: number; expiresAt: number }>;
+  jobs: Array<{
+    processId: string;
+    command: string;
+    startedAt: number;
+    expiresAt: number;
+    launchUnconfirmed?: boolean;
+  }>;
   watches: Array<{
     id: string;
     processId: string;
@@ -215,7 +221,7 @@ export interface SessionBackgroundView {
 export interface SessionBackgroundOutput {
   chunk: string;
   cursor: number;
-  state: "running" | "exited";
+  state: "starting" | "running" | "exited";
   exitCode?: number;
 }
 
@@ -381,6 +387,7 @@ export interface ToolActivity {
 type WorkStatus = "thinking" | "working" | "complete" | "failed";
 export interface WorkBlock {
   status: WorkStatus;
+  queued?: boolean;
   startedAt?: number;
   finishedAt?: number;
   stale?: boolean;
@@ -1232,9 +1239,16 @@ function setWorkStale(work: WorkBlock | undefined, stale: boolean, notify?: () =
   notify?.();
 }
 
-function mergeWork(work: WorkBlock | undefined, run: { activity?: unknown[]; startedAt?: number | null }): boolean {
+function mergeWork(
+  work: WorkBlock | undefined,
+  run: { status?: string; activity?: unknown[]; startedAt?: number | null },
+): boolean {
   if (!work) return false;
   let changed = false;
+  if (run.status && (work.queued ?? false) !== (run.status === "pending")) {
+    work.queued = run.status === "pending";
+    changed = true;
+  }
   if (typeof run.startedAt === "number" && work.startedAt == null) {
     work.startedAt = run.startedAt;
     changed = true;
@@ -1338,7 +1352,11 @@ export async function pollRun(
     if (applyRun(stream, partial, st, run, notify) === "terminal") return;
     if (run.stale === true) st.staleSince ??= now();
     else st.staleSince = undefined;
-    if (run.alive === true || (st.staleSince !== undefined && now() - st.staleSince < STALE_GRACE_MS))
+    if (
+      run.status === "pending" ||
+      run.alive === true ||
+      (st.staleSince !== undefined && now() - st.staleSince < STALE_GRACE_MS)
+    )
       st.lastProgressAt = now();
     if (now() - st.lastProgressAt > RUN_IDLE_MS)
       return fail(stream, partial, "Timed out waiting for the agent to respond.");
@@ -1465,6 +1483,17 @@ function streamRunViaSse(
         swallow("web-ui: handle sse activity event", e);
       }
     });
+    es.addEventListener("status", (e: MessageEvent) => {
+      established = true;
+      try {
+        const d = JSON.parse(e.data) as { status?: string; startedAt?: number | null };
+        if (d.status !== "pending" && d.status !== "running") return;
+        if (d.status === "pending") st.lastProgressAt = now();
+        if (mergeWork((partial as AssistantWork).work, d)) notify?.();
+      } catch (e) {
+        swallow("web-ui: handle sse status event", e);
+      }
+    });
     es.addEventListener("alive", () => {
       established = true;
       st.lastProgressAt = now();
@@ -1504,6 +1533,8 @@ function fail(
   errorMessage: string,
   retryableSend = false,
 ): void {
+  const work = (partial as AssistantWork).work;
+  if (work) work.queued = false;
   const block = partial.content[0];
   const soFar = block?.type === "text" ? block.text : "";
   const error: AssistantMessage = {
@@ -1519,6 +1550,7 @@ function fail(
 
 function abortStream(stream: AssistantMessageEventStream, partial: AssistantMessage): void {
   const work = (partial as AssistantWork).work;
+  if (work) work.queued = false;
   if (work && work.status !== "complete") {
     work.status = "failed";
     work.finishedAt = Date.now();
@@ -1544,6 +1576,8 @@ function pushDelta(stream: AssistantMessageEventStream, partial: AssistantMessag
 }
 
 function finish(stream: AssistantMessageEventStream, partial: AssistantMessage, st: Acc, reply: string): void {
+  const work = (partial as AssistantWork).work;
+  if (work) work.queued = false;
   const finalText = reply.length >= st.acc.length ? reply : st.acc;
   if (finalText.length > st.acc.length) pushDelta(stream, partial, st, finalText);
   const block = partial.content[0];

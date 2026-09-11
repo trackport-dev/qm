@@ -2385,6 +2385,7 @@ const apiRoutes: readonly WebRoute[] = [
       let acc = "";
       let activityLen = 0;
       let lastStale: boolean | null = null;
+      let lastStatus: string | undefined;
       let staleSince: number | null = null;
       let lastProgressAt = Date.now();
       let lastBeat = lastProgressAt;
@@ -2439,6 +2440,11 @@ const apiRoutes: readonly WebRoute[] = [
           lastBeat = now;
         }
         if (parsed) {
+          if ((run.status === "pending" || run.status === "running") && run.status !== lastStatus) {
+            lastStatus = run.status;
+            sseEvent(res, "status", { status: run.status, startedAt: run.startedAt ?? null });
+            lastBeat = now;
+          }
           if (run.stale === true) staleSince ??= now;
           else staleSince = null;
           if ((run.stale === true) !== lastStale) {
@@ -2448,12 +2454,19 @@ const apiRoutes: readonly WebRoute[] = [
           }
         }
         if (now - lastBeat > SSE_HEARTBEAT_MS) {
-          if (run.alive === true) sseEvent(res, "alive", { at: now });
+          if (run.status === "pending")
+            sseEvent(res, "status", { status: "pending", startedAt: run.startedAt ?? null });
+          else if (run.alive === true) sseEvent(res, "alive", { at: now });
           else if (lastStale === true) sseEvent(res, "stale", { stale: true });
           else res.write(": ping\n\n");
           lastBeat = now;
         }
-        if (run.alive === true || (staleSince !== null && now - staleSince < SSE_STALE_GRACE_MS)) lastProgressAt = now;
+        if (
+          run.status === "pending" ||
+          run.alive === true ||
+          (staleSince !== null && now - staleSince < SSE_STALE_GRACE_MS)
+        )
+          lastProgressAt = now;
         const terminal = run.status === "done" || run.status === "failed" || run.result != null;
         if (terminal || run.replyComplete) {
           forgetRun(id);

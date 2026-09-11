@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { CoordinationError, type AudienceCandidate } from "./types.ts";
 
-export function audienceDocument(candidate: AudienceCandidate) {
+function audienceDocument(candidate: AudienceCandidate) {
   return {
     ...candidate.character,
     _qm: { id: candidate.id, name: candidate.name, version: candidate.version, character: candidate.character },

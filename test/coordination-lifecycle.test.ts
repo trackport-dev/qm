@@ -157,9 +157,23 @@ test("deleted intermediate sessions retain ancestry and unfinished reservations 
   assert.deepEqual((await repository.get("peer", grandchild.childId))?.ancestors, [root.id, child.childId]);
   assert.equal((await spawning.inspect(root.id)).count, 2);
   assert.equal((await repository.get("peer", grandchild.childId))?.state, "active");
+  assert.ok(
+    (await spawning.tree(root.id)).some((node) => node.peer.id === child.childId && node.peer.state === "deleted"),
+  );
   assert.equal((await repository.get("peer", pending.childId))?.state, "active");
   await assert.rejects(reserve(grandchild.childId, "too-deep"), /subtree descendant limit reached/);
   await lifecycle.sweep();
   assert.equal((await spawning.inspect(root.id)).count, 2);
   await assert.rejects(reserve(child.childId, "cannot-resurrect"), /agent not found/);
+  await sessions.getOrCreateByThread("partial-child", "dm", root.scopeId, undefined, "web", pending.childId);
+  await sessions.deleteSession(pending.childId);
+  await lifecycle.sweep();
+  assert.equal((await repository.get("peer", pending.childId))?.state, "deleted");
+  assert.equal((await spawning.inspect(root.id)).count, 2);
+  assert.ok(
+    (await spawning.tree(root.id)).some((node) => node.peer.id === pending.childId && node.peer.state === "deleted"),
+  );
+  await assert.rejects(spawning.lowerLimit(root.id, 1), /limits may only decrease/);
+  await spawning.lowerLimit(root.id, 2);
+  await assert.rejects(reserve(root.id, "cannot-reuse-reservation"), /subtree descendant limit reached/);
 });

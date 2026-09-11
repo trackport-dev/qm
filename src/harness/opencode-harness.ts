@@ -73,6 +73,7 @@ export function openCodeHarnessConfigOptions(config: Config): OpenCodeHarnessOpt
       openrouter: false,
     });
   return {
+    nativeSubagents: !config.coordinationEnabled,
     ...(config.modelId ? { defaultModelId: config.modelId } : {}),
     ...(judgeServiceable ? { judgeModelId: config.judgeModelId } : {}),
     ...(config.anthropicApiKey ? { apiKey: config.anthropicApiKey } : {}),
@@ -692,7 +693,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
           },
           tools: {
             ...enabledTools,
-            task: true,
+            task: opts.nativeSubagents !== false,
             read: false,
             write: false,
             bash: false,
@@ -710,6 +711,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             todoread: false,
           },
           permission: {
+            ...(opts.nativeSubagents === false ? { task: "deny" } : {}),
             read: "deny",
             write: "deny",
             edit: "deny",
@@ -723,7 +725,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             doom_loop: "deny",
           },
           agent: {
-            qm: { mode: "primary", prompt: "", tools: { ...enabledTools, task: true } },
+            qm: { mode: "primary", prompt: "", tools: { ...enabledTools, task: opts.nativeSubagents !== false } },
             research: {
               mode: "subagent",
               description: "Research a bounded question and report evidence.",
@@ -1031,7 +1033,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     ];
     const enabled = Object.fromEntries(definitions.map((tool) => [tool.name, false]));
     for (const tool of tools) enabled[bridgeToolName(tool.name)] = true;
-    enabled.task = !turn.readOnly;
+    enabled.task = !turn.readOnly && opts.nativeSubagents !== false;
     let timer: NodeJS.Timeout | undefined;
     let signalsStopped = false;
     try {

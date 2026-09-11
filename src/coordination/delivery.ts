@@ -72,5 +72,3 @@ export function createPeerDeliveryLedger(repository: CoordinationRepository) {
     },
   };
 }
-
-export type PeerDeliveryLedger = ReturnType<typeof createPeerDeliveryLedger>;

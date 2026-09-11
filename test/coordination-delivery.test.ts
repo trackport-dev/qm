@@ -76,16 +76,27 @@ for (const backend of ["memory", "postgres"] as const) {
       });
       assert.deepEqual(
         (await other.pendingDeliveries(100, 2)).map((row) => row.id),
-        ["oldest", "second"],
+        ["second", "third"],
       );
       assert.deepEqual(
         (await other.pendingDeliveries(100, 200)).map((row) => row.id),
-        ["oldest", "second", "third"],
+        ["second", "third"],
       );
       assert.deepEqual(
         (await other.pendingDeliveries(101, 1)).map((row) => row.id),
         ["leased"],
       );
+      assert.equal(
+        (await other.pendingDeliveries(5_000, 200)).some((row) => row.id === "oldest"),
+        false,
+      );
+      assert.equal(
+        (await other.pendingDeliveries(5_001, 200)).some((row) => row.id === "oldest"),
+        true,
+      );
+      const beforeRead = await repository.events(0, 200);
+      await other.pendingDeliveries(5_001, 200);
+      assert.deepEqual(await repository.events(0, 200), beforeRead);
       await assert.rejects(other.pendingDeliveries(100, 0), /invalid/);
       await assert.rejects(other.pendingDeliveries(100, 201), /invalid/);
       await assert.rejects(other.pendingDeliveries(Number.NaN, 10), /invalid/);

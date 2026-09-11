@@ -8,7 +8,7 @@ export function isDeclaredKind(kind: string): kind is ProcessKind {
   return DECLARED_KINDS.has(kind as ProcessKind);
 }
 
-export type ProcessStatus = "running" | "exited" | "reaped";
+export type ProcessStatus = "starting" | "running" | "exited" | "reaped";
 
 export interface ProcessRecord {
   processId: string;
@@ -21,9 +21,11 @@ export interface ProcessRecord {
   status: ProcessStatus;
   sessionRef?: string;
   runId?: string;
+  runAttempt?: number;
 }
 
 interface NewProcessRecord {
+  status?: "starting";
   processId: string;
   scopeId: string;
   sandboxId?: string;
@@ -32,6 +34,7 @@ interface NewProcessRecord {
   ttlMs: number;
   sessionRef?: string;
   runId?: string;
+  runAttempt?: number;
 }
 
 export interface ProcessRegistry {
@@ -48,6 +51,8 @@ export interface ProcessRegistry {
 
 function newRecord(rec: NewProcessRecord, now: number): ProcessRecord {
   if (!isDeclaredKind(rec.kind)) throw new Error(`process kind not declared: ${rec.kind}`);
+  if (rec.runAttempt !== undefined && (!rec.runId || !Number.isSafeInteger(rec.runAttempt) || rec.runAttempt < 1))
+    throw new Error("process attempt requires a run ID and a positive safe integer");
   return {
     processId: rec.processId,
     scopeId: rec.scopeId,
@@ -56,9 +61,10 @@ function newRecord(rec: NewProcessRecord, now: number): ProcessRecord {
     command: rec.command,
     startedAt: now,
     expiresAt: now + rec.ttlMs,
-    status: "running",
+    status: rec.status ?? "running",
     ...(rec.sessionRef ? { sessionRef: rec.sessionRef } : {}),
     ...(rec.runId ? { runId: rec.runId } : {}),
+    ...(rec.runAttempt !== undefined ? { runAttempt: rec.runAttempt } : {}),
   };
 }
 
@@ -67,6 +73,7 @@ export function createMemoryProcessRegistry(): ProcessRegistry {
   return {
     async register(rec) {
       const row = newRecord(rec, Date.now());
+      if (rows.has(row.processId)) throw new Error("process ID is already registered");
       rows.set(row.processId, row);
       return { ...row };
     },
@@ -79,11 +86,15 @@ export function createMemoryProcessRegistry(): ProcessRegistry {
     },
     async liveByScope(scopeId, now = Date.now()) {
       return [...rows.values()]
-        .filter((r) => r.scopeId === scopeId && r.status === "running" && r.expiresAt > now)
+        .filter(
+          (r) => r.scopeId === scopeId && (r.status === "starting" || (r.status === "running" && r.expiresAt > now)),
+        )
         .map((r) => ({ ...r }));
     },
     async listLive(now = Date.now()) {
-      return [...rows.values()].filter((r) => r.status === "running" && r.expiresAt > now).map((r) => ({ ...r }));
+      return [...rows.values()]
+        .filter((r) => r.status === "starting" || (r.status === "running" && r.expiresAt > now))
+        .map((r) => ({ ...r }));
     },
     async markStatus(processId, status) {
       const row = rows.get(processId);
@@ -112,6 +123,7 @@ function pgRowToRecord(r: Record<string, unknown>): ProcessRecord {
     status: r.status as ProcessStatus,
     ...(r.session_ref ? { sessionRef: r.session_ref as string } : {}),
     ...(r.run_id ? { runId: r.run_id as string } : {}),
+    ...(r.run_attempt != null ? { runAttempt: Number(r.run_attempt) } : {}),
   };
 }
 
@@ -132,12 +144,22 @@ export function createPostgresProcessRegistry(connectionString: string): Process
     statements: ["ALTER TABLE process_sessions ADD COLUMN IF NOT EXISTS sandbox_id TEXT"],
   };
   pg.registerMigration(migration);
+  const attemptMigration = {
+    id: "processes/registry/0003-run-attempt",
+    statements: [
+      "ALTER TABLE process_sessions ADD COLUMN IF NOT EXISTS run_attempt BIGINT CHECK (run_attempt IS NULL OR (run_id IS NOT NULL AND run_attempt BETWEEN 1 AND 9007199254740991))",
+    ],
+  };
+  pg.registerMigration(attemptMigration);
   let ready: Promise<void> | undefined;
   const q: typeof pg.q = async (...args) => {
-    ready ??= pg.migrate(migration).catch((error) => {
-      ready = undefined;
-      throw error;
-    });
+    ready ??= pg
+      .migrate(migration)
+      .then(() => pg.migrate(attemptMigration))
+      .catch((error) => {
+        ready = undefined;
+        throw error;
+      });
     await ready;
     return pg.q(...args);
   };
@@ -145,8 +167,8 @@ export function createPostgresProcessRegistry(connectionString: string): Process
     async register(rec) {
       const row = newRecord(rec, Date.now());
       await q(
-        `INSERT INTO process_sessions(process_id, scope_id, kind, command, started_at, expires_at, status, session_ref, run_id, sandbox_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        `INSERT INTO process_sessions(process_id, scope_id, kind, command, started_at, expires_at, status, session_ref, run_id, sandbox_id, run_attempt)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           row.processId,
           row.scopeId,
@@ -158,6 +180,7 @@ export function createPostgresProcessRegistry(connectionString: string): Process
           row.sessionRef ?? null,
           row.runId ?? null,
           row.sandboxId ?? null,
+          row.runAttempt ?? null,
         ],
       );
       return row;
@@ -171,13 +194,16 @@ export function createPostgresProcessRegistry(connectionString: string): Process
     },
     async liveByScope(scopeId, now = Date.now()) {
       const rows = await q(
-        "SELECT * FROM process_sessions WHERE scope_id = $1 AND status = 'running' AND expires_at > $2",
+        "SELECT * FROM process_sessions WHERE scope_id = $1 AND (status = 'starting' OR (status = 'running' AND expires_at > $2))",
         [scopeId, now],
       );
       return rows.map(pgRowToRecord);
     },
     async listLive(now = Date.now()) {
-      const rows = await q("SELECT * FROM process_sessions WHERE status = 'running' AND expires_at > $1", [now]);
+      const rows = await q(
+        "SELECT * FROM process_sessions WHERE status = 'starting' OR (status = 'running' AND expires_at > $1)",
+        [now],
+      );
       return rows.map(pgRowToRecord);
     },
     async markStatus(processId, status) {

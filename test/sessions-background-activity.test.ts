@@ -118,6 +118,25 @@ test("readSessionBackgroundOutput binds the job to the conversation, not just th
   assert.equal(await app.readSessionBackgroundOutput(r1.sessionId!, "p-ghost", "U1", 0), null);
 });
 
+test("unconfirmed background launch stays pending without probing or provisioning its sandbox", async (t) => {
+  const { app, processes, sandbox } = freshApp();
+  const thread = "web:U1:unconfirmed";
+  const result = await app.turn(dm("inspect pending work", thread));
+  await processes!.register({ ...registryRow("p-pending", thread, { ttlMs: -1 }), status: "starting" });
+  const provision = t.mock.method(sandbox, "provision", async () => {
+    throw new Error("must not provision");
+  });
+  const view = await app.sessionBackground(result.sessionId!, "U1");
+  assert.equal(view?.jobs[0]?.launchUnconfirmed, true);
+  assert.deepEqual(await app.readSessionBackgroundOutput(result.sessionId!, "p-pending", "U1", 42), {
+    chunk: "",
+    cursor: 42,
+    state: "starting",
+  });
+  assert.equal(await app.readSessionBackgroundOutput(result.sessionId!, "p-pending", "outsider", 0), null);
+  assert.equal(provision.mock.callCount(), 0);
+});
+
 test("background output follows the recorded computer instead of the scope default", async (t) => {
   const { app, processes, sandbox } = freshApp();
   const thread = "web:U1:dedicated";

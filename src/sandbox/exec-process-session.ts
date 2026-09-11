@@ -17,6 +17,12 @@ export interface ExecProcessIo {
 }
 
 export interface ExecProcessSessions {
+  startRegisteredProcess(
+    handle: SandboxHandle,
+    command: string,
+    register: (processId: string) => Promise<void>,
+    opts?: StartProcessOptions,
+  ): Promise<{ processId: string }>;
   startProcess(handle: SandboxHandle, command: string, opts?: StartProcessOptions): Promise<{ processId: string }>;
   readProcess(handle: SandboxHandle, processId: string, opts?: ReadProcessOptions): Promise<ReadProcessResult>;
   writeStdin(handle: SandboxHandle, processId: string, data: string): Promise<void>;
@@ -74,35 +80,42 @@ export function redactCommand(command: string, env?: Record<string, string>): st
 }
 
 export function createExecProcessSessions(io: ExecProcessIo): ExecProcessSessions {
+  async function startProcess(
+    handle: SandboxHandle,
+    command: string,
+    opts?: StartProcessOptions,
+    register?: (processId: string) => Promise<void>,
+  ): Promise<{ processId: string }> {
+    const processId = randomUUID();
+    const cwd = opts?.cwd ?? handle.rootDir;
+    const env = { ...handle.env, ...opts?.env };
+    const envExports = Object.entries(env)
+      .map(([k, v]) => `export ${k}=${shq(v)}`)
+      .join("; ");
+    const script = [
+      `P="${PROC_BASE}/${processId}"`,
+      `mkdir -p "$P"`,
+      `printf '%s' '${b64(command)}' | base64 -d > "$P/cmd"`,
+      ...(envExports ? [`printf '%s' '${b64(envExports)}' | base64 -d > "$P/env"`] : []),
+      `printf '%s' '${b64(cwd)}' | base64 -d > "$P/cwd"`,
+      `date +%s > "$P/started"`,
+      `{ ${BOOT_ID_SH}; } > "$P/boot" 2>/dev/null || true`,
+      `[ -p "$P/in" ] || mkfifo "$P/in"`,
+      `LAUNCH='d="$1"; cd "$(cat "$d/cwd")" 2>/dev/null; if [ -f "$d/env" ]; then . "$d/env"; rm -f "$d/env"; fi; exec 3<>"$d/in"; cpid=""; _fin(){ [ -f "$d/code" ] || echo 143 > "$d/code"; trap - TERM INT HUP QUIT; [ -n "$cpid" ] && kill -TERM "$cpid" 2>/dev/null; kill -TERM -$$ 2>/dev/null; exit 143; }; trap _fin TERM INT HUP QUIT; sh "$d/cmd" <&3 >"$d/out" 2>&1 & cpid=$!; wait "$cpid"; rc=$?; [ -f "$d/code" ] || echo $rc > "$d/code"'`,
+      `if command -v setsid >/dev/null 2>&1; then setsid sh -c "$LAUNCH" _ "$P" >/dev/null 2>&1 & else sh -c "$LAUNCH" _ "$P" >/dev/null 2>&1 & fi`,
+      `echo $! > "$P/pid"`,
+      `echo OK`,
+    ].join("\n");
+    if (register) await register(processId);
+    const r = await io.run(handle, script, { timeoutMs: 20_000 });
+    if (r.code !== 0 || !r.stdout.includes("OK")) {
+      throw new Error(`startProcess failed (code ${r.code}): ${r.stderr.trim() || r.stdout.trim()}`);
+    }
+    return { processId };
+  }
   return {
-    async startProcess(handle, command, opts): Promise<{ processId: string }> {
-      const processId = randomUUID();
-      const cwd = opts?.cwd ?? handle.rootDir;
-      const env = { ...handle.env, ...opts?.env };
-      const envExports = Object.entries(env)
-        .map(([k, v]) => `export ${k}=${shq(v)}`)
-        .join("; ");
-      const script = [
-        `P="${PROC_BASE}/${processId}"`,
-        `mkdir -p "$P"`,
-        `printf '%s' '${b64(command)}' | base64 -d > "$P/cmd"`,
-        ...(envExports ? [`printf '%s' '${b64(envExports)}' | base64 -d > "$P/env"`] : []),
-        `printf '%s' '${b64(cwd)}' | base64 -d > "$P/cwd"`,
-        `date +%s > "$P/started"`,
-        `{ ${BOOT_ID_SH}; } > "$P/boot" 2>/dev/null || true`,
-        `[ -p "$P/in" ] || mkfifo "$P/in"`,
-        `LAUNCH='d="$1"; cd "$(cat "$d/cwd")" 2>/dev/null; if [ -f "$d/env" ]; then . "$d/env"; rm -f "$d/env"; fi; exec 3<>"$d/in"; cpid=""; _fin(){ [ -f "$d/code" ] || echo 143 > "$d/code"; trap - TERM INT HUP QUIT; [ -n "$cpid" ] && kill -TERM "$cpid" 2>/dev/null; kill -TERM -$$ 2>/dev/null; exit 143; }; trap _fin TERM INT HUP QUIT; sh "$d/cmd" <&3 >"$d/out" 2>&1 & cpid=$!; wait "$cpid"; rc=$?; [ -f "$d/code" ] || echo $rc > "$d/code"'`,
-        `if command -v setsid >/dev/null 2>&1; then setsid sh -c "$LAUNCH" _ "$P" >/dev/null 2>&1 & else sh -c "$LAUNCH" _ "$P" >/dev/null 2>&1 & fi`,
-        `echo $! > "$P/pid"`,
-        `echo OK`,
-      ].join("\n");
-      const r = await io.run(handle, script, { timeoutMs: 20_000 });
-      if (r.code !== 0 || !r.stdout.includes("OK")) {
-        throw new Error(`startProcess failed (code ${r.code}): ${r.stderr.trim() || r.stdout.trim()}`);
-      }
-      return { processId };
-    },
-
+    startProcess,
+    startRegisteredProcess: (handle, command, register, opts) => startProcess(handle, command, opts, register),
     async readProcess(handle, processId, opts): Promise<ReadProcessResult> {
       assertId(processId);
       const cursor = Math.max(0, opts?.sinceCursor ?? 0);

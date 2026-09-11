@@ -499,6 +499,7 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
 
     profile,
     startProcess: procSessions.startProcess,
+    startRegisteredProcess: procSessions.startRegisteredProcess,
     readProcess: procSessions.readProcess,
     writeStdin: procSessions.writeStdin,
     signalProcess: procSessions.signalProcess,

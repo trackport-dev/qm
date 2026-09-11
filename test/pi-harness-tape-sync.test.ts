@@ -145,7 +145,8 @@ for (const peer of [false, true]) {
       assert.equal(messageRows[2]!.meta?.ts, peer ? undefined : "1712.001");
       assert.deepEqual(messageRows[2]!.meta?.peerOrigin, peerOrigin);
       const steered = sink.entries.find((entry) => (entry.payload as { steered?: boolean })?.steered);
-      assert.deepEqual((steered?.payload as { peerOrigin?: unknown }).peerOrigin, peerOrigin);
+      assert.ok(steered);
+      assert.deepEqual((steered.payload as { peerOrigin?: unknown }).peerOrigin, peerOrigin);
       assert.equal(calls, 2);
       assert.equal(tapeRowsAtDispatch[0], 1, "the trigger user row is committed before the first dispatch");
       assert.equal(

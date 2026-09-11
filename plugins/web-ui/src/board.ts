@@ -156,6 +156,7 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
   function treeNode(node: TreeNode): ReturnType<typeof html> {
     return html`<li class="board-tree-node">
       <strong>${node.peer.name}</strong> · ${node.peer.state} · ${node.count}/${node.cap} descendants
+      ${node.peer.state === "deleted" ? html`<p>${node.spawn && node.spawn.state !== "ready" ? "Session deleted; unfinished spawn reservation still occupies an ancestor slot." : "Session deleted; ancestry retained for surviving descendants."}</p>` : nothing}
       ${
         node.spawn
           ? html`<p>
@@ -186,7 +187,7 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
               }}
             >
               <label><input type="checkbox" name="subtree" /> Include descendants</label>
-              ${["pause", "resume", "stop"].map((action) => html`<button class="btn" type="submit" value=${action} ?disabled=${controlling || node.peer.state === "archived"}>${action}</button>`)}
+              ${["pause", "resume", "stop"].map((action) => html`<button class="btn" type="submit" value=${action} ?disabled=${controlling || node.peer.state === "archived" || node.peer.state === "deleted"}>${action}</button>`)}
             </form>`
           : nothing
       }
@@ -204,12 +205,15 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
     moreWaits = false;
     history.replaceState(history.state, "", permalink(id));
     paint();
-    await loadDetail();
+    const applied = await loadDetail();
+    if (applied === detailRequest && selected === id && active())
+      host.querySelector<HTMLElement>("#board-inspector-heading")?.focus();
   }
-  async function loadDetail(): Promise<void> {
+  async function loadDetail(): Promise<number | null> {
     const id = selected;
-    if (!id) return;
+    if (!id) return null;
     const version = ++detailRequest;
+    let applied = false;
     try {
       const result = await request<Detail>(`/api/peer-messages/${encodeURIComponent(id)}`);
       const waits = new Map<string, ReplyWait>();
@@ -233,11 +237,13 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
         detail = result;
         replyWaits = [...waits.values()];
         moreWaits = hasMore;
+        applied = true;
       }
     } catch (error) {
       if (selected === id && version === detailRequest) notice = errMessage(error);
     }
     paint();
+    return applied ? version : null;
   }
   function waitCard(wait: ReplyWait): ReturnType<typeof html> {
     return html`<article class="board-delivery" id=${`wait-${wait.id}`}>
@@ -262,11 +268,12 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
                 ${wait.state === "resumed" ? "consumed by the recipient" : "published; inspect delivery for progress"}.
               </p>
               <button class="btn" @click=${() => void select(wait.resumeMessageId!)}>Inspect continuation</button>`
-          : wait.suspendedAt !== null && wait.outcome
-            ? html`<p>
-                Continuation not yet published. Source execution release and agent lifecycle gates still apply.
-              </p>`
-            : nothing
+          : nothing
+      }
+      ${
+        !wait.resumeMessageId && wait.suspendedAt !== null && wait.outcome
+          ? html`<p>Continuation not yet published. Source execution release and agent lifecycle gates still apply.</p>`
+          : nothing
       }
     </article>`;
   }
@@ -437,7 +444,7 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
             ${
               detail
                 ? html`
-                    <h2>Message inspector</h2>
+                    <h2 id="board-inspector-heading" tabindex="-1">Message inspector</h2>
                     <a href=${permalink(detail.message.id)}>Permalink</a>
                     <p>Sender: ${detail.message.senderName} (${detail.message.senderId})</p>
                     ${

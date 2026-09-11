@@ -2,11 +2,86 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createBackgroundBroker } from "../src/connectors/background-exec-broker.ts";
 import { createMemoryProcessRegistry } from "../src/processes/process-registry.ts";
+import { createProcessReaper } from "../src/processes/process-reaper.ts";
+import { reconcileProcesses } from "../src/processes/reconcile.ts";
 import { redactCommand } from "../src/sandbox/exec-process-session.ts";
 import type { ProcessSandbox, ProcessSession, SandboxHandle, StartProcessOptions } from "../src/sandbox/sandbox.ts";
 
 const SCOPE = "personal:U1";
 const handle: SandboxHandle = { id: "vm", rootDir: "/workspace", homeDir: "/root" };
+
+test("background launches require registration support before starting any process", async () => {
+  const fake = fakeSandbox();
+  delete fake.sandbox.startRegisteredProcess;
+  const registry = createMemoryProcessRegistry();
+  const broker = createBackgroundBroker({ sandbox: fake.sandbox, registry, scopeId: SCOPE });
+  await assert.rejects(broker.start(handle, "work"), /does not support startRegisteredProcess/);
+  assert.equal(fake.starts.length, 0);
+  assert.deepEqual(await registry.listLive(), []);
+});
+
+test("adapters without registered starts can reattach but cannot replace an exited job", async () => {
+  const fake = fakeSandbox();
+  const registry = createMemoryProcessRegistry();
+  const broker = createBackgroundBroker({ sandbox: fake.sandbox, registry, scopeId: SCOPE, pollMs: 0 });
+  const first = await broker.start(handle, "work");
+  delete fake.sandbox.startRegisteredProcess;
+  const attached = await broker.start(handle, "work");
+  assert.equal(attached.processId, first.processId);
+  assert.equal(attached.reattached, true);
+  assert.equal(fake.starts.length, 1);
+  await fake.sandbox.signalProcess(handle, first.processId, "KILL");
+  await assert.rejects(broker.start(handle, "work"), /does not support startRegisteredProcess/);
+  assert.equal(fake.starts.length, 1);
+  assert.equal((await registry.get(first.processId))?.status, "exited");
+});
+
+test("unconfirmed launch survives concurrent starts, missing process probes and expiry", async () => {
+  const fake = fakeSandbox();
+  const registry = createMemoryProcessRegistry();
+  let unblock!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    unblock = resolve;
+  });
+  let registered!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    registered = resolve;
+  });
+  fake.sandbox.startRegisteredProcess = async (h, command, register, opts) => {
+    await register("p-1");
+    registered();
+    await blocked;
+    return fake.sandbox.startProcess(h, command, opts);
+  };
+  const broker = createBackgroundBroker({ sandbox: fake.sandbox, registry, scopeId: SCOPE, pollMs: 1 });
+  const launch = broker.start(handle, "sleep 60", -1);
+  try {
+    await ready;
+    assert.equal((await registry.get("p-1"))?.status, "starting");
+    assert.equal((await registry.liveByScope(SCOPE)).length, 1);
+    assert.equal((await registry.listLive()).length, 1);
+    await assert.rejects(broker.start(handle, "sleep 60"), /unconfirmed/);
+    await assert.rejects(broker.poll(handle, "p-1"), /unconfirmed/);
+    await assert.rejects(broker.write(handle, "p-1", "input"), /unconfirmed/);
+    await assert.rejects(broker.stop(handle, "p-1"), /unconfirmed/);
+    await reconcileProcesses(fake.sandbox, handle, registry, SCOPE);
+    let kills = 0;
+    const reaper = createProcessReaper(registry, {
+      intervalMs: 1_000,
+      kill: async () => {
+        kills++;
+      },
+    });
+    assert.deepEqual(await reaper.sweep(), { reaped: 0 });
+    assert.equal(kills, 0);
+    assert.equal((await registry.get("p-1"))?.status, "starting");
+  } finally {
+    unblock();
+  }
+  assert.equal((await launch).processId, "p-1");
+  assert.equal((await registry.get("p-1"))?.status, "running");
+  assert.equal((await registry.listExpired()).length, 1);
+});
 
 function fakeSandbox(opts?: { seedOutput?: string }) {
   interface Proc {
@@ -47,6 +122,10 @@ function fakeSandbox(opts?: { seedOutput?: string }) {
       return [];
     },
     async removeDir() {},
+    async startRegisteredProcess(h, command, register, startOpts) {
+      await register(`p-${n + 1}`);
+      return sandbox.startProcess(h, command, startOpts);
+    },
     async startProcess(_h, command, startOpts?: StartProcessOptions) {
       const processId = `p-${++n}`;
       starts.push({ command, ...(startOpts ? { opts: startOpts } : {}) });
@@ -434,7 +513,7 @@ test("list distinguishes a TTL-reaped row from a clean exit (registry view, not 
   assert.notEqual(ks.state === "exited" ? ks.code : 0, 0, "a reaped job is NOT surfaced as a clean exit-0");
 });
 
-test("start stamps the conversation's sessionRef on the registry row", async () => {
+test("start stamps the originating run and conversation on the registry row", async () => {
   const fake = fakeSandbox();
   const registry = createMemoryProcessRegistry();
   const broker = createBackgroundBroker({
@@ -442,14 +521,33 @@ test("start stamps the conversation's sessionRef on the registry row", async () 
     registry,
     scopeId: SCOPE,
     sessionRef: "web:U1:thread-9",
+    runId: "originating-run",
+    runAttempt: 1,
     pollMs: 20,
   });
   const { processId } = await broker.start(handle, "sleep 60");
   assert.equal((await registry.get(processId))?.sessionRef, "web:U1:thread-9");
+  assert.equal((await registry.get(processId))?.runId, "originating-run");
+  assert.equal((await registry.get(processId))?.runAttempt, 1);
+
+  const later = createBackgroundBroker({
+    sandbox: fake.sandbox,
+    registry,
+    scopeId: SCOPE,
+    runId: "originating-run",
+    runAttempt: 2,
+    pollMs: 20,
+  });
+  const reattached = await later.start(handle, "sleep 60");
+  assert.equal(reattached.processId, processId);
+  assert.equal((await registry.get(processId))?.runId, "originating-run");
+  assert.equal((await registry.get(processId))?.runAttempt, 1);
 
   const bare = createBackgroundBroker({ sandbox: fake.sandbox, registry, scopeId: SCOPE, pollMs: 20 });
   const { processId: p2 } = await bare.start(handle, "sleep 61");
   assert.equal((await registry.get(p2))?.sessionRef, undefined);
+  assert.equal((await registry.get(p2))?.runId, undefined);
+  assert.equal((await registry.get(p2))?.runAttempt, undefined);
 });
 
 test("background jobs retain sandbox identity across default changes and reattach only on that sandbox", async () => {

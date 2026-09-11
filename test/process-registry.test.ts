@@ -94,6 +94,36 @@ for (const b of backends()) {
 }
 
 const PG_URL = process.env.TEST_DATABASE_URL;
+for (const backend of ["memory", "postgres"] as const) {
+  test(
+    `[${backend}] process attempt attribution is validated and cannot be overwritten`,
+    { skip: backend === "postgres" && !PG_URL },
+    async () => {
+      const registry = backend === "memory" ? createMemoryProcessRegistry() : createPostgresProcessRegistry(PG_URL!);
+      const processId = `attempt-${backend}-${Date.now()}`;
+      const input = {
+        processId,
+        scopeId: "personal:attempt-owner",
+        kind: "background" as const,
+        command: "work",
+        ttlMs: 1000,
+        runId: "run",
+        runAttempt: 1,
+      };
+      try {
+        for (const runAttempt of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN])
+          await assert.rejects(registry.register({ ...input, runAttempt }), /positive safe integer/);
+        await assert.rejects(registry.register({ ...input, runId: undefined }), /run ID/);
+        await registry.register(input);
+        await assert.rejects(registry.register({ ...input, runAttempt: 2 }));
+        assert.equal((await registry.get(processId))?.runAttempt, 1);
+      } finally {
+        await registry.delete(processId);
+        registry.close?.();
+      }
+    },
+  );
+}
 test("[postgres] honors the registry contract (durable across a restart)", { skip: !PG_URL }, async () => {
   const reg = createPostgresProcessRegistry(PG_URL!);
   const scope = `pg-test-${Date.now()}`;
@@ -104,6 +134,8 @@ test("[postgres] honors the registry contract (durable across a restart)", { ski
       kind: "dev-server",
       command: "npm run dev",
       ttlMs: 60_000,
+      runId: "origin-run",
+      runAttempt: 2,
     });
     assert.equal(rec.status, "running");
     assert.ok(rec.expiresAt > rec.startedAt);
@@ -112,7 +144,24 @@ test("[postgres] honors the registry contract (durable across a restart)", { ski
     const live = await reg2.liveByScope(scope);
     assert.equal(live.length, 1);
     assert.equal(live[0]!.processId, id(1));
+    assert.equal(live[0]!.runId, "origin-run");
+    assert.equal(live[0]!.runAttempt, 2);
     assert.equal(typeof live[0]!.expiresAt, "number");
+    await reg.register({
+      processId: id(3),
+      scopeId: scope,
+      kind: "background",
+      command: "pending",
+      ttlMs: -1,
+      status: "starting",
+    });
+    assert.equal((await reg2.get(id(3)))?.status, "starting");
+    assert.ok((await reg2.liveByScope(scope)).some((row) => row.processId === id(3)));
+    assert.ok((await reg2.listLive()).some((row) => row.processId === id(3)));
+    assert.ok(!(await reg2.listExpired()).some((row) => row.processId === id(3)));
+    await reg2.markStatus(id(3), "running");
+    assert.ok((await reg.listExpired()).some((row) => row.processId === id(3)));
+    await reg2.delete(id(3));
 
     await reg2.register({ processId: id(2), scopeId: scope, kind: "build", command: "y", ttlMs: -1 });
     assert.equal(

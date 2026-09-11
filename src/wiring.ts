@@ -7,7 +7,7 @@ import { createPeerDeliveryLedger } from "./coordination/delivery.ts";
 import { createPeerSpawning, type PeerSpawning } from "./coordination/spawning.ts";
 import { createPeerSpawnWorker, type PeerSpawnWorker } from "./coordination/spawn-worker.ts";
 import { createPeerLifecycle, type PeerLifecycle } from "./coordination/lifecycle.ts";
-import { createPeerExecution } from "./coordination/execution.ts";
+import { createPeerExecution, createParkedPeerExecution } from "./coordination/execution.ts";
 import { createMemoryPeerExecutionStore, createPostgresPeerExecutionStore } from "./coordination/execution-store.ts";
 import { createPeerDispatcher, type PeerDispatcher } from "./coordination/dispatcher.ts";
 import { peerInput, verifiedPeerInput } from "./coordination/peer-input.ts";
@@ -422,7 +422,7 @@ export interface BuiltApp {
   peerSpawning?: PeerSpawning;
   peerSpawnWorker?: PeerSpawnWorker;
   peerLifecycle?: PeerLifecycle;
-  peerExecution?: import("./coordination/execution.ts").PeerExecutionService;
+  peerExecution?: ReturnType<typeof createPeerExecution>;
   app: App;
   screenSecurity?: SecurityScreenProbe;
   deploymentLayer: DeploymentLayerRuntime;
@@ -557,8 +557,9 @@ export function buildApp(
   const coordinationRepository = pgArtifactMap
     ? createPostgresCoordinationRepository(pgArtifactMap.pool, config.orgId, {
         postgresSessions: config.sessionStore === "postgres",
+        ...(config.runStore === "memory" ? { memoryRuns: () => runs } : {}),
       })
-    : createMemoryCoordinationRepository();
+    : createMemoryCoordinationRepository({ runs: { get: (id) => runs.get(id) } });
   const peerBoard = config.coordinationEnabled ? createPeerBoard(coordinationRepository) : undefined;
   const peerWaits = config.coordinationEnabled ? createPeerWaits(coordinationRepository) : undefined;
   const peerDeliveryLedger = config.coordinationEnabled ? createPeerDeliveryLedger(coordinationRepository) : undefined;
@@ -1299,8 +1300,9 @@ export function buildApp(
               config.orgId,
               config.coordinationConcurrency,
               config.coordinationTurnLimit,
+              config.runStore === "memory" ? () => runs : undefined,
             )
-          : createMemoryPeerExecutionStore(config.coordinationConcurrency, config.coordinationTurnLimit),
+          : createMemoryPeerExecutionStore(config.coordinationConcurrency, config.coordinationTurnLimit, runs),
       })
     : undefined;
   const peerExecutionSweeper = peerExecution
@@ -1569,9 +1571,10 @@ export function buildApp(
       const authority = await authorizePeer(peer);
       return (
         !!authority &&
-        authority.actor.id === input.actor.id &&
+        peerPrincipalSignature(authority.actor) === peerPrincipalSignature(input.actor) &&
         authority.scopeVersion === input.scopeVersion &&
         authority.conversation.threadRef === input.conversation.threadRef &&
+        peerAudienceMatches(authority.conversation, input.conversation) &&
         !(await peerBlocked(peer.id))
       );
     },
@@ -1766,8 +1769,9 @@ export function buildApp(
           },
         })
     : undefined;
+  const runExecution = peerExecution ?? createParkedPeerExecution({ repository: coordinationRepository, sessions });
   const app = createApp({
-    execution: peerExecution,
+    execution: runExecution,
     identity,
     ...(config.publicWebUrl ? { publicWebUrl: config.publicWebUrl } : {}),
     sessions,
@@ -2018,6 +2022,24 @@ export function buildApp(
     },
     app,
   );
+  function peerPrincipalSignature(principal: PeerAuthority["actor"]): string {
+    return JSON.stringify([principal.id, principal.type, [...new Set(principal.teamIds ?? [])].sort()]);
+  }
+  function peerAudienceMatches(
+    current: PeerAuthority["conversation"],
+    previous: PeerAuthority["conversation"],
+  ): boolean {
+    const roster = (members: PeerAuthority["conversation"]["audience"] = []) =>
+      JSON.stringify([...new Set(members.map(peerPrincipalSignature))].sort());
+    return (
+      current.kind === previous.kind &&
+      current.channelRef === previous.channelRef &&
+      current.isPrivate === previous.isPrivate &&
+      current.isMpim === previous.isMpim &&
+      roster(current.audience) === roster(previous.audience) &&
+      roster(current.publishMembers) === roster(previous.publishMembers)
+    );
+  }
   async function authorizePeer(peer: Peer): Promise<PeerAuthority | null> {
     await identity.refresh();
     const authority = peer.authority;
@@ -2036,7 +2058,37 @@ export function buildApp(
         liveActor: false,
         botActor: false,
       }));
-    return authorized ? { ...authority, actor, scopeVersion } : null;
+    if (!authorized) return null;
+    if ((kind === "channel" || kind === "group") && !(kind === "group" && projects.recognizes(ref))) {
+      const members = await directory.conversationMembers(kind, ref);
+      if (!members?.length) return null;
+      const audience = members.map((member) => identity.classify(member.principalId, member.type === "guest"));
+      const isPrivate = kind === "channel" ? await directory.channelPrivacy(ref) : true;
+      if (isPrivate === undefined) return null;
+      return {
+        ...authority,
+        actor,
+        scopeVersion,
+        conversation: { ...authority.conversation, audience, publishMembers: audience, isPrivate },
+      };
+    }
+    const audience =
+      kind === "group" && projects.recognizes(ref)
+        ? ((await projects.members(ref)) ?? [])
+            .map((id) => identity.classify(id))
+            .filter((member) => identity.isInternal(member))
+        : authority.conversation.audience.map((member) => identity.classify(member.id));
+    if (!audience.some((member) => member.id === actor.id)) audience.push(actor);
+    const publishMembers =
+      kind === "group" && projects.recognizes(ref)
+        ? audience
+        : authority.conversation.publishMembers?.map((member) => identity.classify(member.id));
+    return {
+      ...authority,
+      actor,
+      scopeVersion,
+      conversation: { ...authority.conversation, audience, ...(publishMembers ? { publishMembers } : {}) },
+    };
   }
   async function peerBlocked(id: string): Promise<boolean> {
     return (await approvals.entries()).some(
@@ -2056,9 +2108,10 @@ export function buildApp(
           const authority = peer.authority;
           if (
             !authority ||
-            run.request.actor.id !== authority.actor.id ||
+            peerPrincipalSignature(run.request.actor) !== peerPrincipalSignature(authority.actor) ||
             run.request.origin.kind !== "peer" ||
-            run.request.scopeVersion !== authority.scopeVersion
+            run.request.scopeVersion !== authority.scopeVersion ||
+            !peerAudienceMatches(authority.conversation, run.request.conversation)
           )
             return "followup";
           const decision = await orchestrator.screenSecuritySteer({
@@ -2104,7 +2157,7 @@ export function buildApp(
     ? createSweeper(() => peerLifecycle.sweep(), 1_000, { label: "peer-lifecycle", immediate: true })
     : undefined;
   const peerSpawnWorker =
-    peerDispatcher && peerBoard
+    peerDispatcher && peerBoard && config.sandboxResourcesEnabled
       ? createPeerSpawnWorker({
           repository: coordinationRepository,
           sessions,
@@ -2170,7 +2223,7 @@ export function buildApp(
   });
   const workers: Worker[] = Array.from({ length: Math.max(1, config.workers) }, () =>
     createWorker({
-      execution: peerExecution,
+      execution: runExecution,
       runs,
       sessions,
       orchestrator,
@@ -2451,11 +2504,16 @@ export function serverDeps(
     sessions: built.sessions,
     peerIdentity: built.peerIdentity,
     peerBoard: built.peerBoard,
+    peerInspection: {
+      board: built.peerBoard ?? createPeerBoard(built.coordinationRepository),
+      waits: built.peerWaits ?? createPeerWaits(built.coordinationRepository),
+      spawning: built.peerSpawning ?? createPeerSpawning(built.coordinationRepository),
+    },
     peerWaits: built.peerWaits,
     peerSpawning: built.peerSpawning,
     peerLifecycle: built.peerLifecycle,
     peerExecution: built.peerExecution,
-    peerSpawnBackend: config.sandboxBackend,
+    peerSpawnBackend: config.sandboxResourcesEnabled ? config.sandboxBackend : undefined,
     auditLog: built.auditLog,
     errors: built.errors,
     metrics: built.metrics,

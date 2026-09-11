@@ -373,6 +373,7 @@ export function createSpritesSandbox(workspace: WorkspaceStore, opts: SpritesSan
   return {
     profile,
     startProcess: procSessions.startProcess,
+    startRegisteredProcess: procSessions.startRegisteredProcess,
     readProcess: procSessions.readProcess,
     writeStdin: procSessions.writeStdin,
     signalProcess: procSessions.signalProcess,

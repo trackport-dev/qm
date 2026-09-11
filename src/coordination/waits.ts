@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { CoordinationRepository, CoordinationTransaction } from "./repository.ts";
+import type { CoordinationRepository, CoordinationTransaction, CoordinationRunFence } from "./repository.ts";
 import { CoordinationError, type PeerWait } from "./types.ts";
 
 export function createPeerWaits(repository: CoordinationRepository) {
@@ -60,14 +60,17 @@ export function createPeerWaits(repository: CoordinationRepository) {
       if (!wait) throw new CoordinationError(404, "wait_not_found", "wait not found");
       return wait;
     },
-    async begin(input: {
-      sessionId: string;
-      runId: string;
-      messageId: string;
-      idempotencyKey: string;
-      mode?: "first" | "all";
-      timeoutMs: number;
-    }): Promise<PeerWait> {
+    async begin(
+      input: {
+        sessionId: string;
+        runId: string;
+        messageId: string;
+        idempotencyKey: string;
+        mode?: "first" | "all";
+        timeoutMs: number;
+      },
+      fence?: CoordinationRunFence,
+    ): Promise<PeerWait> {
       if (!input.idempotencyKey || input.idempotencyKey.length > 200)
         throw new CoordinationError(400, "invalid_idempotency_key", "provide an idempotency key of 1–200 characters");
       if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 86_400_000)
@@ -78,47 +81,51 @@ export function createPeerWaits(repository: CoordinationRepository) {
       const id = createHash("sha256")
         .update(JSON.stringify([input.sessionId, input.idempotencyKey]))
         .digest("hex");
-      return repository.transaction([`wait:${id}`, `message:${input.messageId}`], async (tx) => {
-        const existing = await tx.get("wait", id);
-        if (existing) {
-          if (
-            existing.messageId !== input.messageId ||
-            existing.mode !== mode ||
-            existing.timeoutMs !== input.timeoutMs
-          )
-            throw new CoordinationError(409, "wait_conflict", "idempotency key already identifies a different wait");
-          return evaluate(tx, existing, Date.now());
-        }
-        const message = await tx.get("message", input.messageId);
-        if (!message) throw new CoordinationError(404, "message_not_found", "wait target not found");
-        if (message.senderId !== input.sessionId)
-          throw new CoordinationError(
-            403,
-            "wait_owner_required",
-            "agents may wait only for replies to their own messages",
-          );
-        const now = Date.now();
-        const wait: PeerWait = {
-          id,
-          sessionId: input.sessionId,
-          runId: input.runId,
-          messageId: message.id,
-          mode,
-          recipientIds: [...message.recipientIds],
-          replyIds: [],
-          state: "waiting",
-          createdAt: now,
-          deadline: now + input.timeoutMs,
-          timeoutMs: input.timeoutMs,
-          suspendedAt: null,
-          outcome: null,
-          resumeMessageId: null,
-          resumeRunId: null,
-        };
-        await tx.put("wait", wait);
-        await tx.event("wait", id, now);
-        return evaluate(tx, wait, now);
-      });
+      return repository.transaction(
+        [`wait:${id}`, `message:${input.messageId}`],
+        async (tx) => {
+          const existing = await tx.get("wait", id);
+          if (existing) {
+            if (
+              existing.messageId !== input.messageId ||
+              existing.mode !== mode ||
+              existing.timeoutMs !== input.timeoutMs
+            )
+              throw new CoordinationError(409, "wait_conflict", "idempotency key already identifies a different wait");
+            return evaluate(tx, existing, Date.now());
+          }
+          const message = await tx.get("message", input.messageId);
+          if (!message) throw new CoordinationError(404, "message_not_found", "wait target not found");
+          if (message.senderId !== input.sessionId)
+            throw new CoordinationError(
+              403,
+              "wait_owner_required",
+              "agents may wait only for replies to their own messages",
+            );
+          const now = Date.now();
+          const wait: PeerWait = {
+            id,
+            sessionId: input.sessionId,
+            runId: input.runId,
+            messageId: message.id,
+            mode,
+            recipientIds: [...message.recipientIds],
+            replyIds: [],
+            state: "waiting",
+            createdAt: now,
+            deadline: now + input.timeoutMs,
+            timeoutMs: input.timeoutMs,
+            suspendedAt: null,
+            outcome: null,
+            resumeMessageId: null,
+            resumeRunId: null,
+          };
+          await tx.put("wait", wait);
+          await tx.event("wait", id, now);
+          return evaluate(tx, wait, now);
+        },
+        fence,
+      );
     },
     async refresh(id: string): Promise<PeerWait> {
       const observed = await repository.get("wait", id);

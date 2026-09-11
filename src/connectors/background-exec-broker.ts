@@ -1,4 +1,5 @@
 import type { ProcessSandbox, ProcessState, SandboxHandle } from "../sandbox/sandbox.ts";
+import { CapabilityUnsupportedError } from "../sandbox/sandbox.ts";
 import type { ProcessRegistry, ProcessStatus } from "../processes/process-registry.ts";
 import { awaitProcessExit } from "../sandbox/await-process-exit.ts";
 import { pollProcess, processIsGone } from "../sandbox/process-poll.ts";
@@ -11,6 +12,8 @@ export interface BackgroundExecBrokerDeps {
   provisionSandbox?: (id: string) => Promise<SandboxHandle>;
   scopeId: string;
   sessionRef?: string;
+  runId?: string;
+  runAttempt?: number;
   ttlMs?: number;
   ttlMaxMs?: number;
   pollMs?: number;
@@ -73,7 +76,7 @@ const DEFAULT_TERM_GRACE_MS = 2_000;
 const DEFAULT_KILL_GRACE_MS = 1_000;
 
 function stateFromRow(status: ProcessStatus): ProcessState {
-  if (status === "running") return { state: "running" };
+  if (status === "running" || status === "starting") return { state: "running" };
   return { state: "exited", code: status === "reaped" ? 143 : 0 };
 }
 
@@ -104,12 +107,14 @@ export function createBackgroundBroker(deps: BackgroundExecBrokerDeps): Backgrou
               (r) =>
                 r.kind === "background" &&
                 r.command === redacted &&
-                r.status === "running" &&
+                (r.status === "running" || r.status === "starting") &&
                 r.sandboxId === handle.resourceId,
             )?.processId ?? null)
           : null;
 
       if (processId) {
+        if ((await deps.registry.get(processId))?.status === "starting")
+          throw new Error(`background job launch is unconfirmed: ${processId}; retry after launch acknowledgement`);
         const existingProcessId = processId;
         try {
           const read = await deps.sandbox.readProcess(handle, existingProcessId, {
@@ -140,6 +145,7 @@ export function createBackgroundBroker(deps: BackgroundExecBrokerDeps): Backgrou
 
       const register = async (id: string): Promise<void> => {
         await deps.registry.register({
+          status: "starting",
           processId: id,
           scopeId: deps.scopeId,
           ...(handle.resourceId ? { sandboxId: handle.resourceId } : {}),
@@ -147,15 +153,15 @@ export function createBackgroundBroker(deps: BackgroundExecBrokerDeps): Backgrou
           command: redacted,
           ttlMs: ttl,
           ...(deps.sessionRef ? { sessionRef: deps.sessionRef } : {}),
+          ...(deps.runId ? { runId: deps.runId } : {}),
+          ...(deps.runAttempt !== undefined ? { runAttempt: deps.runAttempt } : {}),
         });
       };
       const startOptions = { env: { PYTHONUNBUFFERED: "1" } };
-      if (deps.sandbox.startRegisteredProcess) {
-        ({ processId } = await deps.sandbox.startRegisteredProcess(handle, command, register, startOptions));
-      } else {
-        ({ processId } = await deps.sandbox.startProcess(handle, command, startOptions));
-        await register(processId);
-      }
+      if (!deps.sandbox.startRegisteredProcess)
+        throw new CapabilityUnsupportedError(deps.sandbox.profile.backend, "startRegisteredProcess");
+      ({ processId } = await deps.sandbox.startRegisteredProcess(handle, command, register, startOptions));
+      await deps.registry.markStatus(processId, "running");
 
       const { output, cursor, status } = await pollProcess(deps.sandbox, handle, processId, { deadlineMs: POLL_MS });
       if (status.state === "exited") await deps.registry.markStatus(processId, "exited");
@@ -167,6 +173,8 @@ export function createBackgroundBroker(deps: BackgroundExecBrokerDeps): Backgrou
       if (!rec || rec.scopeId !== deps.scopeId || rec.kind !== "background") {
         throw new Error("no such background job");
       }
+      if (rec.status === "starting")
+        throw new Error("background job launch is unconfirmed; retry after acknowledgement");
       if (rec.sandboxId && rec.sandboxId !== handle.resourceId) {
         if (!deps.provisionSandbox) throw new Error("background job sandbox is unavailable");
         handle = await deps.provisionSandbox(rec.sandboxId);
@@ -185,6 +193,8 @@ export function createBackgroundBroker(deps: BackgroundExecBrokerDeps): Backgrou
       if (!rec || rec.scopeId !== deps.scopeId || rec.kind !== "background") {
         throw new Error("no such background job");
       }
+      if (rec.status === "starting")
+        throw new Error("background job launch is unconfirmed; retry after acknowledgement");
       if (rec.sandboxId && rec.sandboxId !== handle.resourceId) {
         if (!deps.provisionSandbox) throw new Error("background job sandbox is unavailable");
         handle = await deps.provisionSandbox(rec.sandboxId);
@@ -200,6 +210,8 @@ export function createBackgroundBroker(deps: BackgroundExecBrokerDeps): Backgrou
       if (!rec || rec.scopeId !== deps.scopeId || rec.kind !== "background") {
         throw new Error("no such background job");
       }
+      if (rec.status === "starting")
+        throw new Error("background job launch is unconfirmed; cancellation requires executor acknowledgement");
       if (rec.sandboxId && rec.sandboxId !== handle.resourceId) {
         if (!deps.provisionSandbox) throw new Error("background job sandbox is unavailable");
         handle = await deps.provisionSandbox(rec.sandboxId);

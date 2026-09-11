@@ -15,6 +15,7 @@ export function createPeerLifecycle(deps: {
   async function reconcileDeleted(id: string): Promise<void> {
     const observed = await deps.repository.get("peer", id);
     if (!observed || observed.state === "deleted" || (await deps.sessions.get(id))) return;
+    const wasDeleted = await deps.sessions.wasDeleted(id);
     await deps.repository.transaction([`tree:${observed.rootId}`, `peer:${id}`], async (tx) => {
       const peer = await tx.get("peer", id);
       if (!peer || peer.state === "deleted") return;
@@ -22,7 +23,7 @@ export function createPeerLifecycle(deps: {
       if (exists) return;
       if (peer.parentId) {
         const spawn = (await tx.list("spawn", { childId: id }))[0];
-        if (!spawn || spawn.state !== "ready") return;
+        if ((!spawn || spawn.state !== "ready") && !wasDeleted) return;
       }
       const now = Date.now();
       await tx.put("peer", { ...peer, state: "deleted", authority: null, updatedAt: now });

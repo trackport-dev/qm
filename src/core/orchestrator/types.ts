@@ -90,6 +90,7 @@ export interface OrchestratorInput extends Omit<
   conversation: Conversation;
   origin: TurnOrigin;
   runId?: string;
+  runLeaseToken?: string;
   attempt?: number;
 
   runStartedAt?: number;
@@ -97,6 +98,7 @@ export interface OrchestratorInput extends Omit<
   background?: boolean;
   cancel?: AbortSignal;
   onExecutionPending?(operation: Promise<void>): void;
+  authorizeToolExecution?(): Promise<void>;
   queueMs?: number;
   sessionParticipantIds?: readonly string[];
   scopeVersion?: string;

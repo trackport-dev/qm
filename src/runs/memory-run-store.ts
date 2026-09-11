@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { createKeyedQueue } from "../util/async.ts";
 import type { EnqueueInput, EnqueueResult, ReapEvent, Run, RunDeliveryState, RunStore } from "./run-store.ts";
 import { isTerminal, leaseLapsed, releasesDedupKey } from "./run-store.ts";
 import type { LedgerBegin, ToolLedger } from "./tool-ledger.ts";
@@ -177,11 +178,32 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
         .sort((a, b) => a.createdAt - b.createdAt);
     },
 
-    async firstExecutedForThread(sessionId) {
+    async bindSession(runId, leaseToken, sessionRecordId) {
+      const run = runs.get(runId);
+      if (
+        !run ||
+        run.status !== "running" ||
+        run.leaseToken !== leaseToken ||
+        run.leaseExpiresAt === null ||
+        run.leaseExpiresAt <= Date.now() ||
+        (run.sessionRecordId == null && run.result?.sessionId == null && run.attempts !== 1) ||
+        (run.sessionRecordId != null && run.sessionRecordId !== sessionRecordId) ||
+        (run.sessionRecordId == null && run.result?.sessionId != null && run.result.sessionId !== sessionRecordId)
+      )
+        return false;
+      run.sessionRecordId = sessionRecordId;
+      return true;
+    },
+
+    async firstExecutedForSession(sessionId, sessionRecordId) {
       return (
         [...runs.values()]
           .filter(
-            (run) => run.sessionId === sessionId && run.startedAt !== null && run.request.actor.type === "internal",
+            (run) =>
+              run.sessionId === sessionId &&
+              run.startedAt !== null &&
+              run.request.actor.type === "internal" &&
+              (run.sessionRecordId ?? run.result?.sessionId) === sessionRecordId,
           )
           .sort((a, b) => a.startedAt! - b.startedAt! || a.createdAt - b.createdAt)[0] ?? null
       );
@@ -206,7 +228,7 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
     },
 
     async reapExpired(
-      onRetired?: (sessionIds: string[]) => Promise<void>,
+      onRetired?: Parameters<RunStore["reapExpired"]>[0],
       opts?: { maxAgeMs?: number; onReap?: (event: ReapEvent) => void },
     ) {
       const now = Date.now();
@@ -217,11 +239,25 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
         const tooOld = opts?.maxAgeMs !== undefined && run.startedAt !== null && now - run.startedAt > opts.maxAgeMs;
         const reason = tooOld ? "run exceeded max age (reaped)" : "lease expired (reaped)";
         const workerId = run.workerId;
-        if (run.status !== "running" || run.leaseExpiresAt === null || run.leaseExpiresAt > now) continue;
-        run.leaseToken = randomUUID();
-        run.leaseExpiresAt = now + FENCE_HOLD_MS;
-        if (onRetired) await onRetired([run.sessionId]);
-        const r = retire(run, reason, !tooOld);
+        const fenceToken = await mutationQueue("runs", async () => {
+          if (run.status !== "running" || run.leaseExpiresAt === null || run.leaseExpiresAt > now) return null;
+          const retiredToken = run.leaseToken;
+          run.leaseToken = randomUUID();
+          run.leaseExpiresAt = now + FENCE_HOLD_MS;
+          return { token: run.leaseToken, retiredToken };
+        });
+        if (!fenceToken) continue;
+        const boundId = run.sessionRecordId ?? run.result?.sessionId;
+        if (onRetired)
+          await onRetired(
+            [run.sessionId],
+            boundId && fenceToken.retiredToken
+              ? [{ sessionId: boundId, runId: run.id, runLeaseToken: fenceToken.retiredToken }]
+              : [],
+          );
+        const r = await mutationQueue("runs", async () =>
+          run.leaseToken === fenceToken.token ? retire(run, reason, !tooOld) : { applied: false, requeued: false },
+        );
         if (!r.applied) continue;
         if (r.requeued) requeued++;
         else parked++;
@@ -305,5 +341,20 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
     },
   };
 
-  return { runs: store, ledger: toolLedger };
+  const mutationQueue = createKeyedQueue();
+  const locked: RunStore = {
+    ...store,
+    withMutationLock: (action) => mutationQueue("runs", action),
+    enqueue: (...args) => mutationQueue("runs", () => store.enqueue(...args)),
+    claim: (...args) => mutationQueue("runs", () => store.claim(...args)),
+    claimById: (...args) => mutationQueue("runs", () => store.claimById(...args)),
+    heartbeat: (...args) => mutationQueue("runs", () => store.heartbeat(...args)),
+    releaseLease: (...args) => mutationQueue("runs", () => store.releaseLease(...args)),
+    defer: (...args) => mutationQueue("runs", () => store.defer(...args)),
+    complete: (...args) => mutationQueue("runs", () => store.complete(...args)),
+    fail: (...args) => mutationQueue("runs", () => store.fail(...args)),
+    bindSession: (...args) => mutationQueue("runs", () => store.bindSession(...args)),
+    withdraw: (...args) => mutationQueue("runs", () => store.withdraw(...args)),
+  };
+  return { runs: locked, ledger: toolLedger };
 }

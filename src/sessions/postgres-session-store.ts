@@ -536,6 +536,17 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
           `ALTER TABLE session_tape ADD COLUMN IF NOT EXISTS peer_origin JSONB`,
         ],
       },
+      {
+        id: "sessions/store/0017-deleted-identities",
+        statements: [`CREATE TABLE IF NOT EXISTS deleted_session_ids(id TEXT PRIMARY KEY)`],
+      },
+      {
+        id: "sessions/store/0018-run-owned-leases",
+        statements: [
+          `ALTER TABLE session_leases ADD COLUMN IF NOT EXISTS run_id TEXT`,
+          `ALTER TABLE session_leases ADD COLUMN IF NOT EXISTS run_lease_token TEXT`,
+        ],
+      },
     ],
     [
       {
@@ -645,20 +656,25 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
         ...(channelName ? { channelName } : {}),
         ...(surface ? { surface } : {}),
       };
-      await q(
-        "INSERT INTO sessions(id, type, scope_id, thread_ref, created_at, channel_name, surface, last_activity, messages, turns, origin, origin_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$5,0,0,$8,$9) ON CONFLICT DO NOTHING",
-        [
-          session.id,
-          session.type,
-          session.scopeId,
-          session.threadRef,
-          session.createdAt,
-          channelName ?? null,
-          surface ?? null,
-          sessionOrigin(threadRef),
-          cronIdOf(threadRef),
-        ],
-      );
+      await withPgTransaction(await pool(), async (client) => {
+        await lockSession(client, id);
+        if ((await client.query("SELECT 1 FROM deleted_session_ids WHERE id=$1", [id])).rowCount)
+          throw new Error("session reservation refers to a deleted session");
+        await client.query(
+          "INSERT INTO sessions(id, type, scope_id, thread_ref, created_at, channel_name, surface, last_activity, messages, turns, origin, origin_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$5,0,0,$8,$9) ON CONFLICT DO NOTHING",
+          [
+            session.id,
+            session.type,
+            session.scopeId,
+            session.threadRef,
+            session.createdAt,
+            channelName ?? null,
+            surface ?? null,
+            sessionOrigin(threadRef),
+            cronIdOf(threadRef),
+          ],
+        );
+      });
       const rows = await q("SELECT * FROM sessions WHERE thread_ref = $1", [threadRef]);
       if (!rows[0]) throw new Error("session reservation conflicts with existing session");
       return heal(rows[0]!);
@@ -685,20 +701,20 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
       );
     },
 
-    async acquireLease(sessionId, holder): Promise<LeaseAttempt> {
+    async acquireLease(sessionId, holder, owner): Promise<LeaseAttempt> {
       const token = randomUUID();
       const t = now();
       return withPgTransaction(await pool(), async (client) => {
         await lockSession(client, sessionId);
         for (;;) {
           const granted = await client.query(
-            `INSERT INTO session_leases(session_id, token, expires_at, holder, acquired_at)
-               SELECT $1, $2, $3, $5, $4 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = $1)
+            `INSERT INTO session_leases(session_id, token, expires_at, holder, acquired_at, run_id, run_lease_token)
+               SELECT $1, $2, $3, $5, $4, $6, $7 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = $1)
              ON CONFLICT (session_id) DO UPDATE
-               SET token = $2, expires_at = $3, holder = $5, acquired_at = $4
+               SET token = $2, expires_at = $3, holder = $5, acquired_at = $4, run_id = $6, run_lease_token = $7
                WHERE session_leases.expires_at <= $4
              RETURNING token`,
-            [sessionId, token, t + leaseTtlMs, t, holder ?? null],
+            [sessionId, token, t + leaseTtlMs, t, holder ?? null, owner?.runId ?? null, owner?.runLeaseToken ?? null],
           );
           if (granted.rows[0]) return { lease: { sessionId, token } };
           const held = await client.query(
@@ -743,8 +759,14 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
       await q("DELETE FROM session_leases WHERE session_id = $1 AND token = $2", [lease.sessionId, lease.token]);
     },
 
-    async forceReleaseLease(sessionId): Promise<void> {
-      await q("DELETE FROM session_leases WHERE session_id = $1", [sessionId]);
+    async forceReleaseLease(sessionId, owner): Promise<void> {
+      if (owner)
+        await q("DELETE FROM session_leases WHERE session_id = $1 AND run_id = $2 AND run_lease_token = $3", [
+          sessionId,
+          owner.runId,
+          owner.runLeaseToken,
+        ]);
+      else await q("DELETE FROM session_leases WHERE session_id = $1", [sessionId]);
     },
 
     async append(lease, entry: NewEntry): Promise<SessionEntry> {
@@ -1055,6 +1077,10 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
     async deleteSession(sessionId): Promise<void> {
       await withPgTransaction(await pool(), async (client) => {
         await lockSession(client, sessionId);
+        await client.query(
+          "INSERT INTO deleted_session_ids(id) SELECT id FROM sessions WHERE id=$1 ON CONFLICT DO NOTHING",
+          [sessionId],
+        );
         await client.query("DELETE FROM session_llm_requests WHERE session_id = $1", [sessionId]);
         await client.query("DELETE FROM session_leases WHERE session_id = $1", [sessionId]);
         await client.query("DELETE FROM participants WHERE session_id = $1", [sessionId]);
@@ -1064,6 +1090,10 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
         await client.query("DELETE FROM session_pins WHERE session_id = $1", [sessionId]);
         await client.query("DELETE FROM sessions WHERE id = $1", [sessionId]);
       });
+    },
+
+    async wasDeleted(sessionId): Promise<boolean> {
+      return (await q("SELECT 1 FROM deleted_session_ids WHERE id=$1", [sessionId])).length > 0;
     },
 
     async deleteSessionIfEmpty(sessionId): Promise<boolean> {
@@ -1077,6 +1107,7 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
           [sessionId, now()],
         );
         if (gone.rowCount === 0) return false;
+        await client.query("INSERT INTO deleted_session_ids(id) VALUES($1) ON CONFLICT DO NOTHING", [sessionId]);
         await client.query("DELETE FROM session_llm_requests WHERE session_id = $1", [sessionId]);
         await client.query("DELETE FROM session_leases WHERE session_id = $1", [sessionId]);
         await client.query("DELETE FROM participants WHERE session_id = $1", [sessionId]);

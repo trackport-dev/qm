@@ -3,6 +3,12 @@ import type { OrchestratorInput } from "../core/orchestrator.ts";
 
 type RunStatus = "pending" | "running" | "done" | "failed";
 
+export interface RetiredSessionLease {
+  sessionId: string;
+  runId: string;
+  runLeaseToken: string;
+}
+
 export interface ReapEvent {
   runId: string;
   sessionId: string;
@@ -19,6 +25,7 @@ export interface RunDeliveryState {
 export interface Run {
   id: string;
   sessionId: string;
+  sessionRecordId?: string | null;
   status: RunStatus;
   request: OrchestratorInput;
   result: TurnResult | null;
@@ -51,6 +58,7 @@ export interface EnqueueResult {
 
 export interface RunStore {
   readonly maxClaims?: number;
+  withMutationLock?<T>(action: () => Promise<T>): Promise<T>;
 
   enqueue(input: EnqueueInput): Promise<EnqueueResult>;
   getByDedupKey(dedupKey: string): Promise<Run | null>;
@@ -80,7 +88,9 @@ export interface RunStore {
 
   inFlightForThread(sessionId: string): Promise<Run[]>;
 
-  firstExecutedForThread(sessionId: string): Promise<Run | null>;
+  bindSession(runId: string, leaseToken: string, sessionRecordId: string): Promise<boolean>;
+
+  firstExecutedForSession(sessionId: string, sessionRecordId: string): Promise<Run | null>;
 
   withdraw(runId: string): Promise<boolean>;
 
@@ -89,7 +99,7 @@ export interface RunStore {
   list(opts?: { limit?: number }): Promise<Run[]>;
 
   reapExpired(
-    onRetired?: (sessionIds: string[]) => Promise<void>,
+    onRetired?: (sessionIds: string[], sessionLeases: RetiredSessionLease[]) => Promise<void>,
     opts?: { maxAgeMs?: number; onReap?: (event: ReapEvent) => void },
   ): Promise<{ requeued: number; parked: number }>;
 

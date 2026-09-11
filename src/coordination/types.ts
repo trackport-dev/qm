@@ -1,7 +1,7 @@
 import type { Conversation, Principal, ScopeId } from "../types.ts";
 
 export type Character = { [key: string]: JsonValue };
-export type JsonValue = null | boolean | number | string | JsonValue[] | Character;
+type JsonValue = null | boolean | number | string | JsonValue[] | Character;
 
 export interface PeerAuthority {
   actor: Principal;

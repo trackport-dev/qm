@@ -74,7 +74,8 @@ for (const backend of ["memory", "postgres"] as const) {
       assert.deepEqual(rows[0]?.meta?.peerOrigin, origin);
       const projection = projectTapeEntries(session.id, rows);
       assert.ok(projection);
-      assert.deepEqual((projection.entries[0]?.payload as { peerOrigin?: PeerOrigin }).peerOrigin, origin);
+      assert.ok(projection.entries[0]);
+      assert.deepEqual((projection.entries[0].payload as { peerOrigin?: PeerOrigin }).peerOrigin, origin);
       await store.releaseLease(lease);
     },
   );

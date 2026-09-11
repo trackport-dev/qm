@@ -16,11 +16,14 @@ test("killableScript: records its PGID to the per-exec marker first, runs under 
   assert.ok(s.includes(pgidMarkerPath("abc")), "the marker path is the per-exec uid");
   assert.ok(s.includes("echo $$ >"), "the leader writes its own pid (== PGID under setsid)");
   assert.ok(s.includes("do_work"), "the inner command is preserved");
+  assert.ok(s.indexOf(".cancelled") < s.indexOf("do_work"), "cancellation is checked before executing the command");
+  assert.ok(s.includes("|| exit 125"), "a launch without a recorded group fails closed");
   assert.ok(s.includes("__pi_exec_rc=$?") && s.includes("exit $__pi_exec_rc"), "the inner exit code is preserved");
 });
 
 test("killScript: SIGKILLs the whole process group from the marker, retrying for the write race", () => {
   const s = killScript("abc");
+  assert.ok(s.startsWith(`: > '${pgidMarkerPath("abc")}.cancelled' || exit 125`));
   assert.ok(s.includes(`cat '${pgidMarkerPath("abc")}'`), "reads the recorded PGID");
   assert.ok(s.includes('kill -KILL -"$pgid"'), "negative pgid ⇒ kills the whole group");
   assert.match(s, /while \[ \$i -lt 5 \]/, "retries a few times to cover the marker-write race");

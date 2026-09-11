@@ -774,6 +774,10 @@ test("retirement waits for background startup to commit its live registry row", 
   const { options, backend, routes, layers } = fixture((sandbox) => {
     sandbox.profile.processSessions = true;
     sandbox.startProcess = async () => ({ processId: "job" });
+    sandbox.startRegisteredProcess = async (handle, command, register, options) => {
+      await register("job");
+      return sandbox.startProcess!(handle, command, options);
+    };
     sandbox.readProcess = async () => ({ chunks: "", cursor: 0, status: { state: "running" } });
     sandbox.writeStdin = async () => {};
     sandbox.signalProcess = async () => {};
@@ -813,10 +817,18 @@ test("retirement waits for background startup to commit its live registry row", 
   assert.equal((await registry.get("job"))?.sandboxId, record.id);
 });
 
-test("failed background registration kills its process and releases the resource lock", async () => {
+test("failed background registration prevents launch and releases the resource lock", async () => {
+  let starts = 0;
   const { resources, router, backend, layers } = fixture((sandbox) => {
     sandbox.profile.processSessions = true;
-    sandbox.startProcess = async () => ({ processId: "unregistered" });
+    sandbox.startProcess = async () => {
+      starts++;
+      return { processId: "unregistered" };
+    };
+    sandbox.startRegisteredProcess = async (handle, command, register, options) => {
+      await register("unregistered");
+      return sandbox.startProcess!(handle, command, options);
+    };
     sandbox.readProcess = async () => ({ chunks: "", cursor: 0, status: { state: "running" } });
     sandbox.writeStdin = async () => {};
     sandbox.signalProcess = async () => {};
@@ -835,7 +847,8 @@ test("failed background registration kills its process and releases the resource
   };
   const broker = createBackgroundBroker({ sandbox: router, registry, scopeId: "personal:alice", pollMs: 0 });
   await assert.rejects(broker.start(handle, "sleep 60"), /registry unavailable/);
-  assert.deepEqual(signals, ["unregistered:KILL"]);
+  assert.equal(starts, 0);
+  assert.deepEqual(signals, []);
   await resources.retire("alice", record.id);
   assert.equal((await resources.get(record.id)).cleanupPending, false);
 });
