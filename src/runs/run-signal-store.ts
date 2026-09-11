@@ -1,4 +1,4 @@
-import type { TurnRequest } from "../types.ts";
+import type { PeerOrigin, TurnRequest } from "../types.ts";
 
 export type RunSignalKind = "abort" | "steer";
 
@@ -8,6 +8,7 @@ export interface RunSignal {
   ts?: string;
   request?: TurnRequest;
   dedupeKey?: string;
+  peerOrigin?: PeerOrigin;
 }
 
 export interface RunSignalStore {
@@ -39,7 +40,10 @@ export function createMemoryRunSignalStore(): RunSignalStore {
       const list = pending.get(runId) ?? [];
       list.push(signal);
       pending.set(runId, list);
-      const author = signal.kind === "steer" ? signal.request?.actor?.externalId : undefined;
+      const author =
+        signal.kind === "steer" && !signal.peerOrigin && signal.request?.origin?.kind !== "peer"
+          ? signal.request?.actor?.externalId
+          : undefined;
       if (author) authors.set(runId, [...(authors.get(runId) ?? []), { at: Date.now(), author }]);
       for (const cb of listeners.get(runId) ?? []) cb();
       return true;
@@ -88,7 +92,7 @@ export function createMemoryRunSignalStore(): RunSignalStore {
 const SIGNAL_POLL_MS = 5_000;
 
 export interface SignalPollHandlers {
-  onSteer(text: string, ts?: string): Promise<void>;
+  onSteer(text: string, ts?: string, peerOrigin?: PeerOrigin): Promise<void>;
   onAbort(): Promise<void>;
 }
 
@@ -117,7 +121,9 @@ export function startSignalPoll(
             await handlers.onAbort();
             abortDelivered = true;
           }
-        } else if (s.text) await handlers.onSteer(s.text, s.ts);
+        } else if (s.text) {
+          await handlers.onSteer(s.text, s.ts, s.peerOrigin);
+        }
       }
     })()
       .catch((e: unknown) => opts?.onError?.(e))

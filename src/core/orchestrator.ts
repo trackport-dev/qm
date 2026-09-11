@@ -418,7 +418,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   }
 
   return {
-    async screenSecuritySteer({ payload, actor, conversation, sessionId }) {
+    async screenSecuritySteer({ payload, actor, conversation, sessionId, origin = "ambient" }) {
       const resolution = await deps.resolution.resolve(conversation, actor);
       if (resolution.securityPolicy.inboundScreening === "off") return "allow";
       const scopeLabel = deps.resolution.scopeFor(conversation, actor);
@@ -455,7 +455,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               await deps.sessions.recordLlmRequest(sessionId, { ...rec, scopeLabel }, signal);
             }
           : undefined,
-        { hook: "user_input", surface: "steer", origin: "ambient" },
+        { hook: "user_input", surface: "steer", origin },
       ).finally(() => securitySteersInFlight.delete(conversation.threadRef));
       if (verdict?.decision === "auto") {
         if (!verdict.unscreened) return "allow";
@@ -500,9 +500,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     },
 
     async handleTurn(input: OrchestratorInput): Promise<TurnResult> {
+      if (input.origin.kind === "peer" && !(await deps.authorizePeerTurn?.(input)))
+        return { status: "refused", reason: "peer execution authority is no longer valid" };
       await deps.refreshModels?.();
       const { actor, conversation } = input;
-      const automatedTurn = input.origin.kind === "automation";
+      const automatedTurn = input.origin.kind === "automation" || input.origin.kind === "peer";
       const ambientTurn = input.origin.kind === "ambient";
       const humanTurn = input.origin.kind === "human";
       const allInternal =
@@ -726,6 +728,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         ? securityScreenPayload({
             ...input,
             ...turnOriginRequestFields(input.origin),
+            ...(input.origin.kind === "peer" ? { securityScreenData: input.text } : {}),
             overheard: [],
             externalPromptData,
           })
@@ -853,6 +856,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             }
             const taintedPayload: Record<string, unknown> = {
               text: input.text,
+              ...(input.origin.kind === "peer" ? { peerOrigin: input.origin } : {}),
               securityTainted: true,
               hidden: true,
               ...((input.attachments ?? []).some((attachment) => attachment.sourceId)
@@ -1001,7 +1005,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const delivery = deliveryCandidatesFor(input.surface, input.deliveryTarget, input.deliveryCandidates, scopeId);
       const defaultCandidate = delivery.candidates.find((c) => c.key === delivery.defaultKey);
       let defaultDestination: Destination | undefined;
-      if (defaultCandidate) {
+      if (defaultCandidate && input.origin.kind !== "peer") {
         defaultDestination = {
           type: defaultCandidate.type,
           target: defaultCandidate.target,
@@ -2638,11 +2642,15 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         let lastChunkAt: number | undefined;
         const emittedEntries: SessionEntry[] = [];
         const syntheticPrompt =
-          (input.proactiveOpener && !input.text.trim()) || automatedTurn || partial || approvalReplay;
+          (input.proactiveOpener && !input.text.trim()) ||
+          input.origin.kind === "automation" ||
+          partial ||
+          approvalReplay;
         failureUserPayload =
           !syntheticPrompt && input.text.trim()
             ? {
                 text: input.text,
+                ...(input.origin.kind === "peer" ? { peerOrigin: input.origin } : {}),
                 ...((messageTs ?? entryTs) ? { ts: messageTs ?? entryTs } : {}),
                 ...(actor.displayName?.trim() ? { name: actor.displayName.trim() } : {}),
                 ...(input.displayText?.trim() ? { display: input.displayText } : {}),
@@ -2810,6 +2818,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           }
           return deps.harness.turns.runTurn({
             session,
+            ...(input.runId && deps.acceptPeerInput
+              ? {
+                  onPeerInputAccepted: (origin: import("../types.ts").PeerOrigin) =>
+                    deps.acceptPeerInput!(origin, session.id, input.runId!),
+                }
+              : {}),
             ...(userProviderKeys ? { providerKeys: userProviderKeys } : {}),
             ...(claudeOauthToken ? { claudeOauthToken } : {}),
             ...(userHarnessOverride && !restoredRuntime && runtimeHandoffs === 0 ? { runtimePinned: true } : {}),
@@ -2974,12 +2988,19 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               }
               const meta = {
                 ...rec.meta,
+                ...(input.origin.kind === "peer" && rec.meta.bareText === input.text && !rec.meta.peerOrigin
+                  ? { peerOrigin: input.origin }
+                  : {}),
                 ...(actor.displayName?.trim() ? { author: actor.displayName.trim() } : {}),
                 ...(syntheticPrompt || continuation ? { hidden: true } : {}),
                 ...(input.displayText?.trim() && rec.meta.bareText === input.text
                   ? { display: input.displayText }
                   : {}),
               };
+              if (meta.peerOrigin) {
+                meta.author = meta.peerOrigin.senderName;
+                meta.hidden = false;
+              }
               return withManagedRosterVersion(() => deps.sessions.appendTape(lease, { ...rec, meta }));
             },
             emit: async (entry) => {
@@ -2997,11 +3018,22 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                   }
                   if (tainted.type !== "user") return tainted;
                   const payload = isObj(tainted.payload) ? { ...tainted.payload } : {};
+                  if (
+                    input.origin.kind === "peer" &&
+                    payload.text === input.text &&
+                    !payload.steered &&
+                    !payload.peerOrigin
+                  )
+                    payload.peerOrigin = input.origin;
                   if (actor.displayName?.trim() && typeof payload.name !== "string")
                     payload.name = actor.displayName.trim();
                   if (input.displayText?.trim() && payload.text === input.text && typeof payload.display !== "string")
                     payload.display = input.displayText;
                   if (syntheticPrompt || continuation) payload.hidden = true;
+                  if (isObj(payload.peerOrigin) && typeof payload.peerOrigin.senderName === "string") {
+                    payload.name = payload.peerOrigin.senderName;
+                    payload.hidden = false;
+                  }
                   return { ...tainted, payload };
                 })();
                 const appended = await withManagedRosterVersion(() => deps.sessions.append(lease, stored));

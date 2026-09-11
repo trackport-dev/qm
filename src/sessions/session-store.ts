@@ -212,6 +212,7 @@ export async function appendEntryOutsideTurn(
 export const TAPE_IMPORT_MAX_ENTRIES = 500;
 
 export interface TapeMeta {
+  peerOrigin?: import("../types.ts").PeerOrigin;
   bareText?: string;
   ts?: string;
   changeTime?: string;

@@ -6,6 +6,7 @@ import type {
   CommandApprovalGrant,
   Conversation,
   Principal,
+  PeerOrigin,
   PendingApprovalRecord,
   SurfaceContextQuery,
   SurfaceContextResult,
@@ -159,6 +160,8 @@ export interface OrchestratorDeps {
   turnStream?: TurnStream;
   runActivity?: RunActivityStore;
   runs?: RunStore;
+  authorizePeerTurn?(input: OrchestratorInput): Promise<boolean>;
+  acceptPeerInput?(origin: PeerOrigin, sessionId: string, runId: string): Promise<void>;
   tasks?: TaskStore;
   blobTransfer?: BlobTransferStore;
   processes?: ProcessRegistry;
@@ -220,6 +223,7 @@ interface SurfaceSearchStoreHit {
 export interface Orchestrator {
   handleTurn(input: OrchestratorInput): Promise<TurnResult>;
   screenSecuritySteer(input: {
+    origin?: "ambient" | "peer";
     payload: string;
     actor: Principal;
     conversation: Conversation;

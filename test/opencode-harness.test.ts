@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createMemoryRunSignalStore } from "../src/runs/run-signal-store.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -77,6 +78,67 @@ const okAssistant = `{
   },
   parts: [{ id: "prt_1", sessionID: "ses_main", messageID: "msg_1", type: "text", text: "hello from fake" }],
 }`;
+
+for (const evidence of ["accepted", "missing", "rejected", "provider-error", "not-processed"]) {
+  test(`OpenCode peer receipts require successful submission and user evidence (${evidence})`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "qm-opencode-peer-"));
+    const started = join(dir, "started");
+    const signals = createMemoryRunSignalStore();
+    const binaryPath = fakeSidecar(
+      dir,
+      "peer",
+      `
+      if (req.method === "POST" && message) {
+        await readBody(req);
+        require("node:fs").writeFileSync(${JSON.stringify(started)}, "1");
+        while (!globalThis.steered) await new Promise((resolve) => setTimeout(resolve, 10));
+        return json(res, ${okAssistant});
+      }
+      if (req.method === "POST" && url.pathname.endsWith("/prompt_async")) {
+        const body = JSON.parse(await readBody(req));
+        globalThis.steered = body.parts;
+        if (${JSON.stringify(evidence)} === "rejected") { res.writeHead(400); return res.end("rejected"); }
+        return json(res, {});
+      }
+      if (req.method === "GET" && message) return json(res, [${okAssistant},
+        { info: { id: "peer-user", role: ${JSON.stringify(evidence === "missing" ? "assistant" : "user")} }, parts: globalThis.steered ?? [] },
+        { info: { role: "assistant", parentID: "peer-user", time: { completed: ${evidence === "not-processed" ? "null" : "1000"} },
+          error: ${evidence === "provider-error" ? '{ name: "ProviderAuthError" }' : "null"} }, parts: [] }
+      ]);
+    `,
+    );
+    const harness = createOpenCodeHarness({ binaryPath, signals, turnWallClockMs: 5_000 });
+    t.after(async () => {
+      await harness.turns.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const origin = {
+      kind: "peer" as const,
+      senderSessionId: "sender",
+      senderName: "Sender",
+      recipientSessionId: "session-1",
+      deliveryId: "delivery",
+      messageId: "message",
+    };
+    const receipts: unknown[] = [];
+    const running = harness.turns.runTurn({
+      ...turnInput([], []),
+      runId: "peer-run",
+      onPeerInputAccepted: async (peer) => {
+        receipts.push(peer);
+      },
+    });
+    const deadline = Date.now() + 4_000;
+    while (!existsSync(started)) {
+      if (Date.now() > deadline) throw new Error("OpenCode mock did not start");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(receipts, []);
+    await signals.send("peer-run", { kind: "steer", text: "peer request", peerOrigin: origin });
+    await running;
+    assert.deepEqual(receipts, evidence === "accepted" ? [origin] : []);
+  });
+}
 
 function turnInput(entries: SessionEntry[], llmRows: HarnessLlmRequestRecord[]): HarnessTurnInput {
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;

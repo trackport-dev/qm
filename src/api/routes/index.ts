@@ -1,5 +1,6 @@
 import { sendJson } from "../http.ts";
 import { peerRoutes } from "./peers.ts";
+import { peerMessageRoutes } from "./peer-messages.ts";
 import { type ApiCtx, type BaseCtx, type Route } from "./route.ts";
 import { connectorRawRoutes, connectorRoutes } from "./connectors.ts";
 import { deploymentRawRoutes, deploymentRoutes } from "./deployments.ts";
@@ -54,6 +55,7 @@ export const rawRoutes: ReadonlyArray<Route<BaseCtx>> = [
 
 export const apiRoutes: ReadonlyArray<Route<ApiCtx>> = [
   ...peerRoutes,
+  ...peerMessageRoutes,
   ...searchRoutes,
   ...deploymentLayerRoutes,
   ...turnRoutes,

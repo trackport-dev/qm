@@ -114,6 +114,9 @@ export function createPostgresRunSignalStore(connectionString: string): RunSigna
         [runId],
       );
       const ids = rows
+        .filter(
+          (r) => !(r.payload as RunSignal).peerOrigin && (r.payload as RunSignal).request?.origin?.kind !== "peer",
+        )
         .map((r) => (r.payload as RunSignal).request?.actor?.externalId)
         .filter((id): id is string => typeof id === "string" && id !== "");
       return [...new Set(ids)];

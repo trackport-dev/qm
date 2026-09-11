@@ -1446,7 +1446,7 @@ for (const mode of ["turnFailed", "startRejected"] as const) {
   });
 }
 
-function stopReportsFailedCodexBinary(dir: string): string {
+function stopReportsFailedCodexBinary(dir: string, rejectSteer = false): string {
   const path = join(dir, "stop-failed-codex");
   writeFileSync(
     path,
@@ -1468,11 +1468,70 @@ rl.on("line", (line) => {
     send({ id: msg.id, result: {} });
     return send({ method: "turn/completed", params: { threadId: "thread-sf", turn: { id: "turn-sf", status: "failed", error: { message: "turn interrupted" }, items: [] } } });
   }
+  if (msg.method === "turn/steer") {
+    writeFileSync(${JSON.stringify(join(dir, "steered"))}, "1");
+    return send(${rejectSteer ? '{ id: msg.id, error: { code: -1, message: "steer rejected" } }' : "{ id: msg.id, result: {} }"});
+  }
 });
 `,
   );
   chmodSync(path, 0o755);
   return path;
+}
+
+for (const rejectSteer of [false, true]) {
+  test(`Codex peer receipt requires provider acceptance (reject=${rejectSteer})`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "qm-codex-peer-receipt-"));
+    const signals = createMemoryRunSignalStore();
+    const harness = createCodexHarness({
+      binaryPath: stopReportsFailedCodexBinary(dir, rejectSteer),
+      env: testHarnessEnv(dir),
+      turnWallClockMs: 5_000,
+      signals,
+    });
+    t.after(async () => {
+      await harness.turns.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const peerOrigin = {
+      kind: "peer" as const,
+      messageId: "message",
+      senderSessionId: "sender",
+      senderName: "Sender",
+      recipientSessionId: "recipient",
+      deliveryId: "delivery",
+    };
+    const receipts: unknown[] = [];
+    const running = harness.turns.runTurn({
+      session: { id: "recipient" } as Session,
+      runId: "peer-run",
+      input: "hi",
+      systemPrompt: "be concise",
+      history: [],
+      tools: {} as HarnessTurnInput["tools"],
+      scopeLabel: "org:test",
+      orgScopeId: "org:test",
+      emit: async (entry) => ({ ...entry, sessionId: "recipient", seq: 1, createdAt: Date.now() }) as SessionEntry,
+      recordModelCall: () => {},
+      onPeerInputAccepted: async (origin) => {
+        receipts.push(origin);
+      },
+    });
+    const deadline = Date.now() + 4_000;
+    while (!existsSync(join(dir, "started"))) {
+      if (Date.now() > deadline) throw new Error("mock codex did not start");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(receipts, []);
+    await signals.send("peer-run", { kind: "steer", text: "peer task", peerOrigin });
+    while (!existsSync(join(dir, "steered")) || (!rejectSteer && receipts.length === 0)) {
+      if (Date.now() > deadline) throw new Error("mock codex did not receive steering");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await signals.send("peer-run", { kind: "abort" });
+    await running;
+    assert.deepEqual(receipts, rejectSteer ? [] : [peerOrigin]);
+  });
 }
 
 test("a user stop whose interrupted turn reports status=failed is a clean stop, and the stop stays pending", async (t) => {

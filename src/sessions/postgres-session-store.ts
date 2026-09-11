@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createPgPool, type PgPool, type PoolClient, withPgTransaction } from "../persistence/pg-pool.ts";
 import { jsonbSafeStringify } from "../util/text.ts";
-import type { Session, SessionEntry, SessionType, ScopeId } from "../types.ts";
+import type { PeerOrigin, Session, SessionEntry, SessionType, ScopeId } from "../types.ts";
 import type {
   NewSessionPin,
   SessionPin,
@@ -119,6 +119,7 @@ function rowToLlmRequest(r: Record<string, unknown>): LlmRequestRecord {
 
 function rowToTape(r: Record<string, unknown>): TapeRecord {
   const meta = {
+    ...(r.peer_origin != null ? { peerOrigin: r.peer_origin as PeerOrigin } : {}),
     ...(r.bare_text != null ? { bareText: r.bare_text as string } : {}),
     ...(r.ts != null ? { ts: r.ts as string } : {}),
     ...(r.change_time != null ? { changeTime: r.change_time as string } : {}),
@@ -526,6 +527,13 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
            ON CONFLICT (session_id, seq) DO NOTHING`,
         ],
       },
+      {
+        id: "sessions/store/0016-peer-origin-v1",
+        statements: [
+          `SET LOCAL lock_timeout = '3s'`,
+          `ALTER TABLE session_tape ADD COLUMN IF NOT EXISTS peer_origin JSONB`,
+        ],
+      },
     ],
     [
       {
@@ -579,8 +587,8 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
     const stored = jsonbSafeStringify(rec.payload ?? null);
     const createdAt = now();
     await client.query(
-      `INSERT INTO session_tape(session_id, seq, kind, harness, payload, scope_label, bare_text, ts, change_time, hidden, overheard, author, attachments, display, security_tainted, entry_created_at, entry_seq, covers_entry_seq, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+      `INSERT INTO session_tape(session_id, seq, kind, harness, payload, scope_label, bare_text, ts, change_time, hidden, overheard, author, attachments, display, security_tainted, entry_created_at, entry_seq, covers_entry_seq, created_at, peer_origin)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
       [
         sessionId,
         seq,
@@ -601,6 +609,7 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
         rec.entrySeq ?? null,
         rec.coversEntrySeq ?? null,
         createdAt,
+        rec.meta?.peerOrigin ? jsonbSafeStringify(rec.meta.peerOrigin) : null,
       ],
     );
     return { ...rec, payload: JSON.parse(stored), sessionId, seq, createdAt };

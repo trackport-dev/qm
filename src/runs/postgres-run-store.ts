@@ -101,6 +101,14 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         expectedChecksum: "8594c46c02ee90d43292a4c083fedea6c72d93b5f414f75e9e20d2db51b1b595",
         statements: [`SET LOCAL lock_timeout = '3s'`, `ALTER TABLE runs ADD COLUMN IF NOT EXISTS turn_user_seq BIGINT`],
       },
+      {
+        id: "runs/store/0004-execution-owner-v1",
+        statements: [
+          `CREATE INDEX IF NOT EXISTS idx_runs_first_internal_execution_v1
+           ON runs(session_id, started_at, created_at, seq)
+           WHERE started_at IS NOT NULL AND request::jsonb->'actor'->>'type'='internal'`,
+        ],
+      },
     ],
     [
       {
@@ -320,6 +328,16 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
         [sessionId],
       );
       return rows.map(rowToRun);
+    },
+
+    async firstExecutedForThread(sessionId): Promise<Run | null> {
+      const { rows } = await q(
+        `SELECT * FROM runs WHERE session_id=$1 AND started_at IS NOT NULL
+         AND request::jsonb->'actor'->>'type'='internal'
+         ORDER BY started_at, created_at, seq LIMIT 1`,
+        [sessionId],
+      );
+      return rows[0] ? rowToRun(rows[0]) : null;
     },
 
     async withdraw(runId: string): Promise<boolean> {

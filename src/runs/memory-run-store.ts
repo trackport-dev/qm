@@ -163,6 +163,16 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
         .sort((a, b) => a.createdAt - b.createdAt);
     },
 
+    async firstExecutedForThread(sessionId) {
+      return (
+        [...runs.values()]
+          .filter(
+            (run) => run.sessionId === sessionId && run.startedAt !== null && run.request.actor.type === "internal",
+          )
+          .sort((a, b) => a.startedAt! - b.startedAt! || a.createdAt - b.createdAt)[0] ?? null
+      );
+    },
+
     async withdraw(runId) {
       const run = runs.get(runId);
       if (!run || run.status !== "pending") return false;

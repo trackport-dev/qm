@@ -1,5 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
 import type { ScopeId } from "../types.ts";
+import type { SessionStore } from "../sessions/session-store.ts";
+import type { RunStore } from "../runs/run-store.ts";
+import { conversationScope } from "../resolution/resolution-service.ts";
 import type { CoordinationRepository } from "./repository.ts";
 import { CoordinationError, publicPeer, type Character, type Peer, type PeerAuthority } from "./types.ts";
 
@@ -30,16 +33,43 @@ function peerName(name: string): string {
   return value;
 }
 
-export function createPeerIdentity(repository: CoordinationRepository) {
+export function createPeerIdentity(
+  repository: CoordinationRepository,
+  history?: { sessions: SessionStore; runs: RunStore },
+) {
+  async function historicalAuthority(id: string, scopeId: ScopeId): Promise<PeerAuthority | null> {
+    const session = await history!.sessions.get(id);
+    if (!session || session.scopeId !== scopeId) return null;
+    const run = await history!.runs.firstExecutedForThread(session.threadRef);
+    if (!run) return null;
+    const { actor, conversation, surface, scopeVersion } = run.request;
+    if (
+      actor.type !== "internal" ||
+      conversation.threadRef !== session.threadRef ||
+      conversation.kind !== session.type ||
+      conversationScope(conversation, actor.id) !== scopeId
+    )
+      return null;
+    return {
+      actor,
+      conversation,
+      surface: surface ?? session.surface ?? "web",
+      ...(scopeVersion ? { scopeVersion } : {}),
+    };
+  }
   return {
     async ensure(input: { id: string; scopeId: ScopeId; authority?: PeerAuthority; now?: number }): Promise<Peer> {
+      const observed = await repository.get("peer", input.id);
+      let authority: PeerAuthority | null | undefined;
+      if (!observed?.authority)
+        authority = history ? await historicalAuthority(input.id, input.scopeId) : input.authority;
       return repository.transaction([`peer:${input.id}`], async (tx) => {
         const existing = await tx.get("peer", input.id);
         if (existing) {
           if (existing.scopeId !== input.scopeId)
             throw new CoordinationError(409, "peer_scope_changed", "session scope differs from its peer identity");
-          if (!existing.authority && input.authority) {
-            const updated = { ...existing, authority: input.authority };
+          if (!existing.authority && authority) {
+            const updated = { ...existing, authority };
             await tx.put("peer", updated);
             return updated;
           }
@@ -57,7 +87,7 @@ export function createPeerIdentity(repository: CoordinationRepository) {
           ancestors: [],
           descendantLimit: DEFAULT_DESCENDANT_LIMIT,
           state: "active",
-          authority: input.authority ?? null,
+          authority: authority ?? null,
           sandboxId: null,
           createdAt: now,
           updatedAt: now,

@@ -1,5 +1,5 @@
 import type { RuntimeControl, RuntimeHandoff } from "./runtime-types.ts";
-import type { AttachmentMeta, ConversationTurn, ScopeId, Session, SessionEntry } from "../types.ts";
+import type { AttachmentMeta, ConversationTurn, PeerOrigin, ScopeId, Session, SessionEntry } from "../types.ts";
 import type { HarnessId } from "../model/pi-models.ts";
 import type {
   GapPhases,
@@ -73,6 +73,7 @@ export interface CodexTurnAuth {
 export interface HarnessTurnInput {
   session: Session;
   runId?: string;
+  onPeerInputAccepted?(origin: PeerOrigin): Promise<void>;
   cancel?: AbortSignal;
   input: string;
   triggerTs?: string;

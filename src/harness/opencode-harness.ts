@@ -1,4 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { hasUserInput } from "./peer-input-receipts.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
@@ -881,13 +882,35 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     }
     const wallMs = turn.turnWallClockMs ?? defaultTurnWallClockMs;
     const queuedSignals = new Set<Promise<void>>();
-    const queueSignal = (text: string): Promise<void> => {
+    const queueSignal = (text: string, peerOrigin?: import("../types.ts").PeerOrigin): Promise<void> => {
       const pending = (async () => {
-        await rt.client.session.promptAsync({
+        const submitted = await rt.client.session.promptAsync({
           path: { id: sessionId },
           body: { model, agent: "qm", parts: [{ type: "text", text }] },
         });
+        if (submitted.error) throw new Error("OpenCode rejected steering input");
         await waitForSessionIdle(rt.client, sessionId, wallMs > 0 ? wallMs : OPENCODE_IDLE_WAIT_MS);
+        if (peerOrigin && !state.stopped && !turn.cancel?.aborted) {
+          const listed = await rt.client.session.messages({ path: { id: sessionId } });
+          const messages = listed.data ?? [];
+          const inputs = new Set(
+            messages
+              .filter((message) =>
+                hasUserInput({ messages: [{ role: message.info.role, content: message.parts }] }, text),
+              )
+              .map((message) => message.info.id),
+          );
+          if (
+            messages.some(
+              (message) =>
+                message.info.role === "assistant" &&
+                inputs.has(message.info.parentID) &&
+                !message.info.error &&
+                !!message.info.time.completed,
+            )
+          )
+            await turn.onPeerInputAccepted?.(peerOrigin);
+        }
       })();
       queuedSignals.add(pending);
       return pending;
@@ -899,13 +922,13 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             turn.runId,
             {
               onAbort: async () => abort(true),
-              onSteer: async (text, ts) => {
+              onSteer: async (text, ts, peerOrigin) => {
                 await turn.emit({
                   type: "user",
-                  payload: { text, ...(ts ? { ts } : {}), steered: true },
+                  payload: { text, ...(ts ? { ts } : {}), steered: true, ...(peerOrigin ? { peerOrigin } : {}) },
                   scopeLabel: turn.scopeLabel,
                 });
-                await queueSignal(text);
+                await queueSignal(text, peerOrigin);
               },
             },
             { onError: (error) => swallow("opencode signal poll", error), drainOnStop: true },

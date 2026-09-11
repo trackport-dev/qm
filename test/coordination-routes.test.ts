@@ -78,6 +78,30 @@ test("peer routes expose public character, enforce session attribution, and pres
   assert.equal(stale.status, 409);
   const forged = await token("alice", { sessionId: "other", runId: run.id, threadRef: session.threadRef });
   assert.equal((await request("/v1/peers/self", forged)).status, 403);
+  const post = (cap: string, body: unknown, path = "/v1/peer-messages") =>
+    fetch(base + path, {
+      method: "POST",
+      headers: { "x-agent-capability": cap, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  const publication = {
+    text: "Public progress update",
+    audience: "empty",
+    idempotencyKey: "progress",
+    senderId: "forged",
+  };
+  const published = await post(own, publication);
+  assert.equal(published.status, 200, await published.clone().text());
+  const message = ((await published.json()) as { message: { id: string; senderId: string } }).message;
+  assert.equal(message.senderId, session.id);
+  const detail = await request(`/v1/peer-messages/${message.id}`, bob);
+  assert.equal(detail.status, 200, await detail.clone().text());
+  assert.ok((await detail.text()).includes(publication.text));
+  assert.equal((await post(bob, publication)).status, 403);
+  assert.equal((await post(forged, publication)).status, 403);
+  assert.equal((await post(bob, { audience: ".[]" }, "/v1/peer-messages/preview")).status, 200);
+  assert.equal((await request("/v1/peer-messages?limit=-1", bob)).status, 400);
   await built.runs.complete(run.id, claimed.leaseToken!, { status: "silent" });
+  assert.equal((await post(own, { ...publication, idempotencyKey: "stale" })).status, 403);
   assert.equal((await request(`/v1/peers/${peer.id}/character`, own, { version: 2, character: {} })).status, 403);
 });

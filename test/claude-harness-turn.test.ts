@@ -105,44 +105,104 @@ function harnessTurn(overrides: Partial<HarnessTurnInput> = {}): {
   return { turn, entries, modelCalls, llmRequests };
 }
 
-test("a steered turn persists every reply, not only the last result's", async () => {
-  const signals = createMemoryRunSignalStore();
-  const runId = "run-steer";
-  currentScript = async function* (prompts) {
-    const iterator = prompts[Symbol.asyncIterator]();
-    await iterator.next();
-    await signals.send(runId, { kind: "steer", text: "now do the other three", ts: "123.456" });
-    await iterator.next();
-    yield assistantMessage("msg_A", "The capital of France is Paris.", {
-      input_tokens: 3,
-      output_tokens: 8,
-      cache_read_input_tokens: 50,
-      cache_creation_input_tokens: 0,
-    });
-    yield resultMessage("The capital of France is Paris.");
-    yield assistantMessage("msg_B", "All four done.", {
-      input_tokens: 4,
-      output_tokens: 5,
-      cache_read_input_tokens: 60,
-      cache_creation_input_tokens: 0,
-    });
-    yield resultMessage("All four done.", { num_turns: 2 });
-  };
+for (const peer of [false, true]) {
+  test(`a steered turn persists every reply, not only the last result's (peer=${peer})`, async () => {
+    const peerOrigin = peer
+      ? {
+          kind: "peer" as const,
+          messageId: "m",
+          senderSessionId: "sender",
+          senderName: "Builder",
+          recipientSessionId: "session-1",
+          deliveryId: "m:session-1",
+        }
+      : undefined;
+    const signals = createMemoryRunSignalStore();
+    const runId = "run-steer";
+    const receipts: unknown[] = [];
+    currentScript = async function* (prompts) {
+      const iterator = prompts[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      yield { ...first.value, session_id: "sdk-session", uuid: "initial" };
+      await signals.send(runId, { kind: "steer", text: "now do the other three", ts: "123.456", peerOrigin });
+      const next = await iterator.next();
+      assert.deepEqual(receipts, [], "queueing alone does not acknowledge input");
+      yield { ...next.value, session_id: "sdk-session", uuid: next.value.uuid ?? "human" };
+      yield assistantMessage("msg_A", "The capital of France is Paris.", {
+        input_tokens: 3,
+        output_tokens: 8,
+        cache_read_input_tokens: 50,
+        cache_creation_input_tokens: 0,
+      });
+      yield resultMessage("The capital of France is Paris.");
+      yield assistantMessage("msg_B", "All four done.", {
+        input_tokens: 4,
+        output_tokens: 5,
+        cache_read_input_tokens: 60,
+        cache_creation_input_tokens: 0,
+      });
+      yield resultMessage("All four done.", { num_turns: 2 });
+    };
 
-  const harness = createClaudeHarness({ signals });
-  const { turn, entries } = harnessTurn({ runId });
-  const result = await harness.turns.runTurn(turn);
+    const harness = createClaudeHarness({ signals });
+    const { turn, entries } = harnessTurn({
+      runId,
+      onPeerInputAccepted: async (origin) => {
+        receipts.push(origin);
+      },
+    });
+    const result = await harness.turns.runTurn(turn);
 
-  assert.equal(result.reply, "All four done.");
-  const assistantTexts = entries
-    .filter((entry) => entry.type === "assistant")
-    .map((entry) => (entry.payload as { text: string }).text);
-  assert.deepEqual(assistantTexts, ["The capital of France is Paris.", "All four done."]);
-  const userTexts = entries
-    .filter((entry) => entry.type === "user")
-    .map((entry) => (entry.payload as { text: string }).text);
-  assert.deepEqual(userTexts, ["what is the capital of france?", "now do the other three"]);
-});
+    assert.equal(result.reply, "All four done.");
+    assert.deepEqual(receipts, peerOrigin ? [peerOrigin] : []);
+    const assistantTexts = entries
+      .filter((entry) => entry.type === "assistant")
+      .map((entry) => (entry.payload as { text: string }).text);
+    assert.deepEqual(assistantTexts, ["The capital of France is Paris.", "All four done."]);
+    const userTexts = entries
+      .filter((entry) => entry.type === "user")
+      .map((entry) => (entry.payload as { text: string }).text);
+    assert.deepEqual(userTexts, ["what is the capital of france?", "now do the other three"]);
+    const steered = entries.find((entry) => (entry.payload as { steered?: boolean })?.steered);
+    assert.deepEqual((steered?.payload as { peerOrigin?: unknown }).peerOrigin, peerOrigin);
+  });
+}
+
+for (const failure of ["crash", "provider-error"]) {
+  test(`Claude does not acknowledge echoed peer input before successful processing (${failure})`, async () => {
+    const signals = createMemoryRunSignalStore();
+    const peerOrigin = {
+      kind: "peer" as const,
+      messageId: "m",
+      deliveryId: "d",
+      senderSessionId: "sender",
+      senderName: "Sender",
+      recipientSessionId: "session-1",
+    };
+    const receipts: unknown[] = [];
+    currentScript = async function* (prompts) {
+      const iterator = prompts[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      yield { ...first.value, session_id: "sdk", uuid: "initial" };
+      await signals.send("failed-peer", { kind: "steer", text: "peer work", peerOrigin });
+      const next = await iterator.next();
+      yield { ...next.value, session_id: "sdk", uuid: next.value.uuid! };
+      assert.deepEqual(receipts, []);
+      if (failure === "crash") throw new Error("subprocess crashed");
+      yield resultMessage("initial done");
+      yield resultMessage("", { subtype: "error_during_execution", errors: ["provider failed"], is_error: true });
+    };
+    const harness = createClaudeHarness({ signals });
+    const { turn } = harnessTurn({
+      runId: "failed-peer",
+      onPeerInputAccepted: async (origin) => {
+        receipts.push(origin);
+      },
+    });
+    await assert.rejects(harness.turns.runTurn(turn), /subprocess crashed|provider failed/);
+    assert.deepEqual(receipts, []);
+  });
+}
 
 test("a user stop that surfaces as a non-success SDK result is a clean stop, and the stop stays pending", async () => {
   const signals = createMemoryRunSignalStore();

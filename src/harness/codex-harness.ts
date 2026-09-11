@@ -1098,10 +1098,10 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
             turn.runId,
             {
               onAbort: async () => interrupt(true),
-              onSteer: async (text, ts) => {
+              onSteer: async (text, ts, peerOrigin) => {
                 const steered = await turn.emit({
                   type: "user",
-                  payload: { text, ...(ts ? { ts } : {}), steered: true },
+                  payload: { text, ...(ts ? { ts } : {}), steered: true, ...(peerOrigin ? { peerOrigin } : {}) },
                   scopeLabel: turn.scopeLabel,
                 });
                 if (turn.tape) {
@@ -1112,6 +1112,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
                     entrySeq: steered.seq,
                     meta: {
                       bareText: text,
+                      ...(peerOrigin ? { peerOrigin } : {}),
                       ...(ts ? { ts } : {}),
                       entryCreatedAt: steered.createdAt,
                     },
@@ -1119,6 +1120,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
                   });
                 }
                 await rt.server.request("turn/steer", { threadId, expectedTurnId: turnId, input: [userInput(text)] });
+                if (peerOrigin) await turn.onPeerInputAccepted?.(peerOrigin);
               },
             },
             { onError: (error) => swallow("codex signal poll", error) },

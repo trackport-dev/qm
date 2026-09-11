@@ -1597,6 +1597,7 @@ interface HistoryAttachment {
 }
 
 interface HistoryUserMessage {
+  peerOrigin?: { messageId: string; senderSessionId: string; senderName: string };
   role: "user";
   content: string;
   timestamp?: number;
@@ -1748,6 +1749,7 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
       hidden?: boolean;
       steered?: boolean;
       name?: string;
+      peerOrigin?: { messageId: string; senderSessionId: string; senderName: string };
       ts?: string;
       workStartedAt?: number;
       workFinishedAt?: number;
@@ -1806,6 +1808,7 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
           content: userText,
           timestamp: e.createdAt,
           ...(payload?.steered ? { steered: true } : {}),
+          ...(payload?.peerOrigin ? { peerOrigin: payload.peerOrigin } : {}),
           ...(typeof payload?.name === "string" && payload.name.trim() ? { speaker: payload.name.trim() } : {}),
           ...(typeof payload?.ts === "string" && payload.ts ? { ts: payload.ts } : {}),
         };

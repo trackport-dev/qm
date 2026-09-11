@@ -1,4 +1,5 @@
 import { Type } from "typebox";
+import { createPeerInputReceipts, type PeerInputReceipts } from "./peer-input-receipts.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,7 +34,7 @@ const TURN_EFFORT_LEVELS = new Set<string>([
   "ultracode",
   "auto",
 ]);
-import type { ConversationTurn, ScopeId, SessionEntry } from "../types.ts";
+import type { ConversationTurn, PeerOrigin, ScopeId, SessionEntry } from "../types.ts";
 import type {
   GapPhase,
   GapPhases,
@@ -437,6 +438,7 @@ export function sanitizeTitle(out: string | undefined): string | undefined {
 }
 
 interface TurnSession {
+  peerInputs: PeerInputReceipts;
   agentSession: AgentSession;
   ref: ToolContextRef;
   composedPromptTokens: number;
@@ -1495,7 +1497,9 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
     tapeFold?: unknown[],
     tape?: HarnessTurnInput["tape"],
     turnProviderKeys?: ProviderKeys,
+    onPeerInputAccepted?: HarnessTurnInput["onPeerInputAccepted"],
   ): Promise<{ entry: TurnSession; compileMs: number }> {
+    const peerInputs = createPeerInputReceipts(onPeerInputAccepted);
     const compileStart = Date.now();
     let reconstructed: PiReplayMessage[] | null;
     try {
@@ -1632,10 +1636,12 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
               swallow("pi: llm request capture", e);
             }
           }
+          peerInputs.prepare(finalPayload);
           return finalPayload;
         };
         const priorResponse = agent.onResponse;
         agent.onResponse = async (response, model) => {
+          await peerInputs.response(response.status);
           try {
             const calls = ref.modelDispatch;
             const last = calls?.[calls.length - 1];
@@ -1668,6 +1674,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
     }
 
     const entry: TurnSession = {
+      peerInputs,
       agentSession: session,
       ref,
       composedPromptTokens: countTokens(composedPrompt),
@@ -1717,6 +1724,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           turn.tapeFold,
           turn.tape,
           turn.providerKeys,
+          turn.onPeerInputAccepted,
         );
         try {
           const turnWallClockMs = turn.turnWallClockMs ?? defaultTurnWallClockMs;
@@ -1798,7 +1806,12 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           let tapeError: Error | undefined;
           let tapedTriggerUser = false;
           const toolAbort = new AbortController();
-          const pendingSteerTapeMeta: Array<{ text: string; ts?: string; entryCreatedAt: number }> = [];
+          const pendingSteerTapeMeta: Array<{
+            text: string;
+            ts?: string;
+            entryCreatedAt: number;
+            peerOrigin?: PeerOrigin;
+          }> = [];
           const steerTapeStamp = (message: unknown): TapeMeta | undefined => {
             const text = textFromContent((message as { content?: unknown }).content);
             const at = pendingSteerTapeMeta.findIndex((p) => p.text === text);
@@ -1806,6 +1819,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
             const [steer] = pendingSteerTapeMeta.splice(at, 1);
             return {
               bareText: steer!.text,
+              ...(steer!.peerOrigin ? { peerOrigin: steer!.peerOrigin } : {}),
               ...(steer!.ts ? { ts: steer!.ts } : {}),
               entryCreatedAt: steer!.entryCreatedAt,
             };
@@ -1985,6 +1999,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
                 scopeLabel: turn.scopeLabel,
                 meta: {
                   bareText: steer.text,
+                  ...(steer.peerOrigin ? { peerOrigin: steer.peerOrigin } : {}),
                   ...(steer.ts ? { ts: steer.ts } : {}),
                   entryCreatedAt: steer.entryCreatedAt,
                 },
@@ -2034,21 +2049,24 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
                   signals,
                   turn.runId,
                   {
-                    onSteer: async (text, ts) => {
-                      if (ts && !steeredSeen.has(ts)) {
-                        steeredSeen.add(ts);
+                    onSteer: async (text, ts, peerOrigin) => {
+                      const identity = peerOrigin?.deliveryId ?? ts;
+                      if (identity && !steeredSeen.has(identity)) {
                         try {
                           const steered = await turn.emit({
                             type: "user",
-                            payload: { text, ts, steered: true },
+                            payload: { text, ts, steered: true, ...(peerOrigin ? { peerOrigin } : {}) },
                             scopeLabel: turn.scopeLabel,
                           });
-                          pendingSteerTapeMeta.push({ text, ts, entryCreatedAt: steered.createdAt });
+                          steeredSeen.add(identity);
+                          pendingSteerTapeMeta.push({ text, ts, entryCreatedAt: steered.createdAt, peerOrigin });
                         } catch (e) {
+                          if (peerOrigin) throw e;
                           swallow("pi: steer persist", e);
                         }
                       }
                       if (entry.agentSession.isStreaming) entry.ref.silentRequested = false;
+                      if (peerOrigin) entry.peerInputs.add(peerOrigin.deliveryId, peerOrigin, text);
                       await entry.agentSession.steer(text);
                     },
                     onAbort: async () => {

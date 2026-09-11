@@ -1,11 +1,31 @@
 import { createKeyedQueue } from "../util/async.ts";
 import { withPgTransaction, type PgPool, type PoolClient } from "../persistence/pg-pool.ts";
-import type { CoordinationEvent, CoordinationKind, CoordinationRows } from "./types.ts";
+import type { CoordinationEvent, CoordinationKind, CoordinationRows, PeerDelivery, PeerMessage } from "./types.ts";
+
+export interface PeerMessageQuery {
+  after: number;
+  limit: number;
+  senderId?: string;
+  recipientId?: string;
+  threadId?: string;
+  rootId?: string;
+  text?: string;
+  group?: string;
+  role?: string;
+}
+
+export interface PeerMessagePage {
+  messages: Omit<PeerMessage, "candidates">[];
+  nextCursor: number;
+  hasMore: boolean;
+}
 
 export interface CoordinationRead {
   get<K extends CoordinationKind>(kind: K, id: string): Promise<CoordinationRows[K] | null>;
   list<K extends CoordinationKind>(kind: K, filter?: Partial<CoordinationRows[K]>): Promise<CoordinationRows[K][]>;
   events(after: number, limit: number): Promise<CoordinationEvent[]>;
+  pendingDeliveries(now: number, limit: number): Promise<PeerDelivery[]>;
+  messagePage(query: PeerMessageQuery): Promise<PeerMessagePage>;
 }
 
 export interface CoordinationTransaction extends CoordinationRead {
@@ -53,11 +73,61 @@ export function createMemoryCoordinationRepository(): CoordinationRepository {
       eventWindow(after, limit);
       return structuredClone(log.filter((event) => event.sequence > after).slice(0, limit));
     },
+    async pendingDeliveries(now, limit) {
+      eventWindow(now, limit);
+      return structuredClone(
+        [...data.delivery.values()]
+          .filter((row) => row.state !== "consumed" && row.state !== "failed" && row.leaseUntil <= now)
+          .sort((a, b) => a.updatedAt - b.updatedAt || a.id.localeCompare(b.id))
+          .slice(0, limit),
+      );
+    },
+    async messagePage(query) {
+      eventWindow(query.after, query.limit);
+      const peers = query.rootId
+        ? new Set(
+            [...data.peer.values()]
+              .filter((peer) => peer.id === query.rootId || peer.ancestors.includes(query.rootId!))
+              .map((peer) => peer.id),
+          )
+        : null;
+      const text = query.text?.toLowerCase();
+      const rows = [...data.message.values()]
+        .filter(
+          (message) =>
+            message.sequence > query.after &&
+            (!query.senderId || message.senderId === query.senderId) &&
+            (!query.recipientId || message.recipientIds.includes(query.recipientId)) &&
+            (!query.threadId || message.threadId === query.threadId) &&
+            (!peers || peers.has(message.senderId) || message.recipientIds.some((id) => peers.has(id))) &&
+            (!text || message.text.toLowerCase().includes(text)) &&
+            ((!query.group && !query.role) ||
+              message.candidates.some(
+                (candidate) =>
+                  candidate.id === message.senderId &&
+                  (!query.group || candidate.character.group === query.group) &&
+                  (!query.role || candidate.character.role === query.role),
+              )),
+        )
+        .sort((a, b) => a.sequence - b.sequence);
+      const messages = rows.slice(0, query.limit).map((message) => {
+        const summary: Partial<PeerMessage> = { ...message };
+        delete summary.candidates;
+        return summary as Omit<PeerMessage, "candidates">;
+      });
+      return structuredClone({
+        messages,
+        nextCursor: messages.at(-1)?.sequence ?? query.after,
+        hasMore: rows.length > query.limit,
+      });
+    },
   });
   return {
     get: (kind, id) => read(rows, events).get(kind, id),
     list: (kind, filter) => read(rows, events).list(kind, filter),
     events: (after, limit) => read(rows, events).events(after, limit),
+    pendingDeliveries: (now, limit) => read(rows, events).pendingDeliveries(now, limit),
+    messagePage: (query) => read(rows, events).messagePage(query),
     transaction: (_locks, action) =>
       queue("transaction", async () => {
         const next = structuredClone(rows);
@@ -98,15 +168,38 @@ const migration = {
   ],
 };
 
+const deliveryIndexMigration = {
+  id: "coordination/0002-delivery-dispatch-index",
+  statements: [
+    `CREATE INDEX IF NOT EXISTS coordination_pending_deliveries
+      ON coordination_records (org_id, ((json->>'updatedAt')::bigint), id COLLATE "C")
+      WHERE kind = 'delivery' AND json->>'state' IN ('queued', 'delivered', 'blocked')`,
+  ],
+};
+
+const messageIndexMigration = {
+  id: "coordination/0003-message-page-index",
+  statements: [
+    `CREATE INDEX IF NOT EXISTS coordination_message_sequence
+      ON coordination_records (org_id, ((json->>'sequence')::bigint)) WHERE kind='message'`,
+  ],
+};
+
 export function createPostgresCoordinationRepository(pg: PgPool, orgId: string): CoordinationRepository {
   if (!orgId) throw new Error("coordination requires an organization");
   pg.registerMigration(migration);
+  pg.registerMigration(deliveryIndexMigration);
+  pg.registerMigration(messageIndexMigration);
   let initializing: Promise<void> | undefined;
   const ready = () =>
-    (initializing ??= pg.migrate(migration).catch((error) => {
-      initializing = undefined;
-      throw error;
-    }));
+    (initializing ??= pg
+      .migrate(migration)
+      .then(() => pg.migrate(deliveryIndexMigration))
+      .then(() => pg.migrate(messageIndexMigration))
+      .catch((error) => {
+        initializing = undefined;
+        throw error;
+      }));
   const read = (client?: PoolClient): CoordinationRead => {
     const query = async (sql: string, values: unknown[]) => {
       if (client) return (await client.query(sql, values)).rows;
@@ -136,6 +229,53 @@ export function createPostgresCoordinationRepository(pg: PgPool, orgId: string):
           [orgId, after, limit],
         );
         return result.map((row) => ({ sequence: Number(row.seq), kind: row.kind, id: row.id, at: Number(row.at) }));
+      },
+      async pendingDeliveries(now, limit) {
+        eventWindow(now, limit);
+        const result = await query(
+          `SELECT json FROM coordination_records
+           WHERE org_id=$1 AND kind='delivery'
+             AND json->>'state' IN ('queued', 'delivered', 'blocked')
+             AND (json->>'leaseUntil')::bigint <= $2
+           ORDER BY (json->>'updatedAt')::bigint, id COLLATE "C" LIMIT $3`,
+          [orgId, now, limit],
+        );
+        return result.map((row) => row.json);
+      },
+      async messagePage(input) {
+        eventWindow(input.after, input.limit);
+        const values: unknown[] = [orgId, input.after];
+        const parameter = (value: unknown) => {
+          values.push(value);
+          return `$${values.length}`;
+        };
+        const conditions = ["m.org_id=$1", "m.kind='message'", "(m.json->>'sequence')::bigint>$2"];
+        if (input.senderId) conditions.push(`m.json->>'senderId'=${parameter(input.senderId)}`);
+        if (input.recipientId)
+          conditions.push(`m.json @> ${parameter(JSON.stringify({ recipientIds: [input.recipientId] }))}::jsonb`);
+        if (input.threadId) conditions.push(`m.json->>'threadId'=${parameter(input.threadId)}`);
+        if (input.text) conditions.push(`strpos(lower(m.json->>'text'), lower(${parameter(input.text)}))>0`);
+        if (input.group || input.role) {
+          const character = {
+            ...(input.group ? { group: input.group } : {}),
+            ...(input.role ? { role: input.role } : {}),
+          };
+          conditions.push(`EXISTS (SELECT 1 FROM jsonb_array_elements(m.json->'candidates') AS candidate
+            WHERE candidate->>'id'=m.json->>'senderId' AND candidate->'character' @> ${parameter(JSON.stringify(character))}::jsonb)`);
+        }
+        if (input.rootId) {
+          const root = parameter(input.rootId);
+          conditions.push(`EXISTS (SELECT 1 FROM coordination_records p WHERE p.org_id=m.org_id AND p.kind='peer'
+            AND (p.id=${root} OR p.json->'ancestors' @> jsonb_build_array(${root}::text))
+            AND (p.id=m.json->>'senderId' OR m.json->'recipientIds' @> jsonb_build_array(p.id)))`);
+        }
+        const result = await query(
+          `SELECT m.json - 'candidates' AS json FROM coordination_records m WHERE ${conditions.join(" AND ")}
+           ORDER BY (m.json->>'sequence')::bigint LIMIT ${parameter(input.limit + 1)}`,
+          values,
+        );
+        const messages = result.slice(0, input.limit).map((row) => row.json as Omit<PeerMessage, "candidates">);
+        return { messages, nextCursor: messages.at(-1)?.sequence ?? input.after, hasMore: result.length > input.limit };
       },
     };
   };

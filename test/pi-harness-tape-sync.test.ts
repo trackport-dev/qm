@@ -78,64 +78,91 @@ function gatedSse(events: Array<Record<string, unknown>>, gate: Promise<void>): 
   return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
-test("tape rows land synchronously in consumption order, steers at their injection point", async () => {
-  const signals = createMemoryRunSignalStore();
-  const harness = createPiHarness({ apiKey: "sk-test", signals });
-  const sink: Sink = { entries: [], tape: [] };
-  let releaseFirstStep = () => {};
-  const steerQueued = new Promise<void>((resolve) => {
-    releaseFirstStep = () => setTimeout(resolve, 50);
-  });
-  const tapeRowsAtDispatch: number[] = [];
-  const requestMessages: Array<Array<{ role: string }>> = [];
-  const realFetch = globalThis.fetch;
-  let calls = 0;
-  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-    calls += 1;
-    tapeRowsAtDispatch.push(sink.tape.filter((rec) => rec.kind === "message").length);
-    requestMessages.push((JSON.parse(String(init?.body ?? "{}")) as { messages?: [] }).messages ?? []);
-    if (calls === 1) return gatedSse(textReplyEvents("first step"), steerQueued);
-    return sse(textReplyEvents("final reply"));
-  }) as typeof globalThis.fetch;
-  try {
-    const turn = turnInput("tape-order", sink, { runId: "run-order" });
-    const emit = turn.emit;
-    turn.emit = async (entry) => {
-      const appended = await emit(entry);
-      if (entry.type === "user" && (entry.payload as { steered?: unknown }).steered === true) releaseFirstStep();
-      return appended;
-    };
-    setTimeout(() => {
-      void signals.send("run-order", { kind: "steer", text: "actually, do it differently", ts: "1712.001" });
-    }, 30);
-    const result = await harness.turns.runTurn(turn);
-    assert.equal(result.reply, "final reply");
+for (const peer of [false, true]) {
+  test(`tape rows land synchronously in consumption order, steers at their injection point (peer=${peer})`, async () => {
+    const peerOrigin = peer
+      ? {
+          kind: "peer" as const,
+          messageId: "m",
+          senderSessionId: "sender",
+          senderName: "Builder",
+          recipientSessionId: "tape-order",
+          deliveryId: "m:tape-order",
+        }
+      : undefined;
+    const signals = createMemoryRunSignalStore();
+    const harness = createPiHarness({ apiKey: "sk-test", signals });
+    const sink: Sink = { entries: [], tape: [] };
+    let releaseFirstStep = () => {};
+    const steerQueued = new Promise<void>((resolve) => {
+      releaseFirstStep = () => setTimeout(resolve, 50);
+    });
+    const tapeRowsAtDispatch: number[] = [];
+    const receipts: unknown[] = [];
+    const requestMessages: Array<Array<{ role: string }>> = [];
+    const realFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      calls += 1;
+      assert.equal(receipts.length, 0, "no input is acknowledged before its provider response");
+      tapeRowsAtDispatch.push(sink.tape.filter((rec) => rec.kind === "message").length);
+      requestMessages.push((JSON.parse(String(init?.body ?? "{}")) as { messages?: [] }).messages ?? []);
+      if (calls === 1) return gatedSse(textReplyEvents("first step"), steerQueued);
+      return sse(textReplyEvents("final reply"));
+    }) as typeof globalThis.fetch;
+    try {
+      const turn = turnInput("tape-order", sink, {
+        runId: "run-order",
+        onPeerInputAccepted: async (origin) => {
+          receipts.push(origin);
+        },
+      });
+      const emit = turn.emit;
+      turn.emit = async (entry) => {
+        const appended = await emit(entry);
+        if (entry.type === "user" && (entry.payload as { steered?: unknown }).steered === true) releaseFirstStep();
+        return appended;
+      };
+      setTimeout(() => {
+        void signals.send("run-order", {
+          kind: "steer",
+          text: "actually, do it differently",
+          ...(peerOrigin ? { peerOrigin } : { ts: "1712.001" }),
+        });
+      }, 30);
+      const result = await harness.turns.runTurn(turn);
+      assert.equal(result.reply, "final reply");
+      assert.deepEqual(receipts, peerOrigin ? [peerOrigin] : []);
 
-    const messageRows = sink.tape.filter((rec) => rec.kind === "message");
-    assert.deepEqual(
-      messageRows.map((rec) => (rec.payload as { role: string }).role),
-      ["user", "assistant", "user", "assistant"],
-      "the tape holds exactly the consumed messages, in consumption order",
-    );
-    assert.equal(messageRows[0]!.meta?.bareText, "do the thing");
-    assert.equal(messageRows[2]!.meta?.bareText, "actually, do it differently");
-    assert.equal(messageRows[2]!.meta?.ts, "1712.001", "the steer row is stamped with its arrival ts");
-    assert.equal(calls, 2);
-    assert.equal(tapeRowsAtDispatch[0], 1, "the trigger user row is committed before the first dispatch");
-    assert.equal(
-      tapeRowsAtDispatch[1],
-      3,
-      "step 2 is not dispatched until the trigger, first reply, and injected steer are all on the tape",
-    );
-    assert.deepEqual(
-      requestMessages[1]!.map((message) => message.role),
-      ["user", "assistant", "user"],
-      "the steer was injected into the model context exactly where the tape says",
-    );
-  } finally {
-    globalThis.fetch = realFetch;
-  }
-});
+      const messageRows = sink.tape.filter((rec) => rec.kind === "message");
+      assert.deepEqual(
+        messageRows.map((rec) => (rec.payload as { role: string }).role),
+        ["user", "assistant", "user", "assistant"],
+        "the tape holds exactly the consumed messages, in consumption order",
+      );
+      assert.equal(messageRows[0]!.meta?.bareText, "do the thing");
+      assert.equal(messageRows[2]!.meta?.bareText, "actually, do it differently");
+      assert.equal(messageRows[2]!.meta?.ts, peer ? undefined : "1712.001");
+      assert.deepEqual(messageRows[2]!.meta?.peerOrigin, peerOrigin);
+      const steered = sink.entries.find((entry) => (entry.payload as { steered?: boolean })?.steered);
+      assert.deepEqual((steered?.payload as { peerOrigin?: unknown }).peerOrigin, peerOrigin);
+      assert.equal(calls, 2);
+      assert.equal(tapeRowsAtDispatch[0], 1, "the trigger user row is committed before the first dispatch");
+      assert.equal(
+        tapeRowsAtDispatch[1],
+        3,
+        "step 2 is not dispatched until the trigger, first reply, and injected steer are all on the tape",
+      );
+      assert.deepEqual(
+        requestMessages[1]!.map((message) => message.role),
+        ["user", "assistant", "user"],
+        "the steer was injected into the model context exactly where the tape says",
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+}
 
 test("a failed tape append fails the turn loudly with the append error, no checkpoint", async () => {
   const harness = createPiHarness({ apiKey: "sk-test" });

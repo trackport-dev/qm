@@ -1082,6 +1082,41 @@ const apiRoutes: readonly WebRoute[] = [
   { method: "GET", path: "/api/playgrounds/:id", handle: (c) => serveFileContent(c, true) },
   {
     method: "GET",
+    path: "/api/peer-messages",
+    handle: async (c) => {
+      const query = new URLSearchParams(c.url.searchParams);
+      query.set("principalId", c.user);
+      return relayCore(c.res, "GET", `/v1/peer-messages?${query}`);
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/peer-messages/:id",
+    handle: async (c) =>
+      relayCore(
+        c.res,
+        "GET",
+        `/v1/peer-messages/${encodeURIComponent(c.params.id!)}?principalId=${encodeURIComponent(c.user)}`,
+      ),
+  },
+  {
+    method: "POST",
+    path: "/api/peer-messages/preview",
+    handle: async (c) =>
+      relayCore(
+        c.res,
+        "POST",
+        `/v1/peer-messages/preview?principalId=${encodeURIComponent(c.user)}`,
+        await readBody(c.req),
+      ),
+  },
+  {
+    method: "GET",
+    path: "/api/peers",
+    handle: async (c) => relayCore(c.res, "GET", `/v1/peers?principalId=${encodeURIComponent(c.user)}`),
+  },
+  {
+    method: "GET",
     path: "/api/user-model-auth/status",
     handle: async (c) =>
       relayCore(c.res, "GET", `/v1/user-model-auth/status?principalId=${encodeURIComponent(c.user)}`),

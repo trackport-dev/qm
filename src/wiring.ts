@@ -1,5 +1,9 @@
 import { createRuntimeService } from "./harness/runtime-control.ts";
 import { createPeerIdentity, type PeerIdentity } from "./coordination/identity.ts";
+import { createPeerBoard, type PeerBoard } from "./coordination/board.ts";
+import { createPeerDeliveryLedger } from "./coordination/delivery.ts";
+import { createPeerDispatcher, type PeerDispatcher } from "./coordination/dispatcher.ts";
+import type { Peer, PeerAuthority } from "./coordination/types.ts";
 import {
   createMemoryCoordinationRepository,
   createPostgresCoordinationRepository,
@@ -97,7 +101,7 @@ import type {
   SurfaceContextRequest,
   Webhook,
 } from "./types.ts";
-import { personalScope, scopeId } from "./types.ts";
+import { parseScopeId, personalScope, scopeId } from "./types.ts";
 import { createAuditLog, type AuditLog } from "./audit/audit-log.ts";
 import { createPostgresAuditLog } from "./admin/postgres-audit-log.ts";
 import { createRateLimiter, type RateLimiter } from "./ratelimit/rate-limiter.ts";
@@ -403,6 +407,8 @@ export function stopWithBackstop(
 export interface BuiltApp {
   coordinationRepository: CoordinationRepository;
   peerIdentity?: PeerIdentity;
+  peerBoard?: PeerBoard;
+  peerDispatcher?: PeerDispatcher;
   app: App;
   screenSecurity?: SecurityScreenProbe;
   deploymentLayer: DeploymentLayerRuntime;
@@ -537,7 +543,8 @@ export function buildApp(
   const coordinationRepository = pgArtifactMap
     ? createPostgresCoordinationRepository(pgArtifactMap.pool, config.orgId)
     : createMemoryCoordinationRepository();
-  const peerIdentity = config.coordinationEnabled ? createPeerIdentity(coordinationRepository) : undefined;
+  const peerBoard = config.coordinationEnabled ? createPeerBoard(coordinationRepository) : undefined;
+  const peerDeliveryLedger = config.coordinationEnabled ? createPeerDeliveryLedger(coordinationRepository) : undefined;
   const artifactMap = <T>(table: string): DurableMap<T> =>
     pgArtifactMap ? pgArtifactMap.map<T>(table) : createMemoryMap<T>();
   setProviderBaseUrls(config.providerBaseUrls);
@@ -1264,6 +1271,9 @@ export function buildApp(
       ? createPostgresRunStore(requireDbUrl("RUN_STORE"), { maxClaims: config.maxClaims })
       : createMemoryRunStore({ maxClaims: config.maxClaims });
   const runs: RunStore = runStore.runs;
+  const peerIdentity = config.coordinationEnabled
+    ? createPeerIdentity(coordinationRepository, { sessions, runs })
+    : undefined;
   const ledger = runStore.ledger;
 
   let processes: ProcessRegistry | undefined;
@@ -1494,6 +1504,34 @@ export function buildApp(
   };
   const orchestratorDeps: OrchestratorDeps = {
     peerIdentity,
+    acceptPeerInput: async (origin, sessionId, runId) => {
+      if (origin.recipientSessionId !== sessionId || !peerDeliveryLedger) return;
+      await peerDeliveryLedger.consume(origin.deliveryId, sessionId, runId);
+    },
+    authorizePeerTurn: async (input) => {
+      if (!peerIdentity || input.origin.kind !== "peer") return false;
+      const [peer, session] = await Promise.all([
+        coordinationRepository.get("peer", input.origin.recipientSessionId),
+        sessions.get(input.origin.recipientSessionId),
+      ]);
+      if (
+        !peer ||
+        !session ||
+        peer.state !== "active" ||
+        session.archived ||
+        session.scopeId !== peer.scopeId ||
+        session.threadRef !== input.conversation.threadRef
+      )
+        return false;
+      const authority = await authorizePeer(peer);
+      return (
+        !!authority &&
+        authority.actor.id === input.actor.id &&
+        authority.scopeVersion === input.scopeVersion &&
+        authority.conversation.threadRef === input.conversation.threadRef &&
+        !(await peerBlocked(peer.id))
+      );
+    },
     refreshModels,
     identity,
     resolution,
@@ -1930,6 +1968,64 @@ export function buildApp(
     },
     app,
   );
+  async function authorizePeer(peer: Peer): Promise<PeerAuthority | null> {
+    await identity.refresh();
+    const authority = peer.authority;
+    if (!authority) return null;
+    const actor = identity.classify(authority.actor.id);
+    if (!identity.isInternal(actor)) return null;
+    const { kind, ref } = parseScopeId(peer.scopeId);
+    const scopeVersion =
+      kind === "group" && projects.recognizes(ref) ? await projects.version(ref) : authority.scopeVersion;
+    const authorized =
+      (await app.belongsToScope(actor.id, peer.scopeId)) &&
+      (await app.authorizesCapabilityScope({
+        actorId: actor.id,
+        scopeId: peer.scopeId,
+        scopeVersion,
+        liveActor: false,
+        botActor: false,
+      }));
+    return authorized ? { ...authority, actor, scopeVersion } : null;
+  }
+  async function peerBlocked(id: string): Promise<boolean> {
+    return (await approvals.entries()).some(
+      ([, approval]) => approval.sessionId === id && approval.blocksInput !== false,
+    );
+  }
+  const peerDispatcher = config.coordinationEnabled
+    ? createPeerDispatcher({
+        repository: coordinationRepository,
+        identity: peerIdentity!,
+        runs,
+        signals: runSignals,
+        sessions,
+        authorize: authorizePeer,
+        blocked: peerBlocked,
+        prepareSteer: async (peer, _message, run, text) => {
+          const authority = peer.authority;
+          if (
+            !authority ||
+            run.request.actor.id !== authority.actor.id ||
+            run.request.origin.kind !== "peer" ||
+            run.request.scopeVersion !== authority.scopeVersion
+          )
+            return "followup";
+          const decision = await orchestrator.screenSecuritySteer({
+            payload: text,
+            actor: authority.actor,
+            conversation: authority.conversation,
+            sessionId: peer.id,
+            origin: "peer",
+          });
+          return decision === "allow" ? "ready" : "followup";
+        },
+        enqueue: (request) => app.turn(request),
+      })
+    : undefined;
+  const peerDispatchSweeper = peerDispatcher
+    ? createSweeper(() => peerDispatcher.sweep(), 1_000, { label: "peer-dispatch", immediate: true })
+    : undefined;
   const monitorPoller: MonitorPoller | null =
     processes && supportsProcessSessions(sandbox)
       ? createMonitorPoller({
@@ -2050,6 +2146,7 @@ export function buildApp(
       deepIdleSweeper?.start();
       wakeSweep.start();
       orphanedSignalSweeper.start();
+      peerDispatchSweeper?.start();
       drain.start();
     },
     async releaseInFlightRuns() {
@@ -2068,6 +2165,7 @@ export function buildApp(
       fileUploads?.stop();
       wakeSweep.stop();
       orphanedSignalSweeper.stop();
+      peerDispatchSweeper?.stop();
       await Promise.all(workers.map((w) => w.stop(config.shutdownDrainMs))).catch(
         swallowAs("wiring: worker drain failed", undefined),
       );
@@ -2087,6 +2185,8 @@ export function buildApp(
     app,
     coordinationRepository,
     peerIdentity,
+    peerBoard,
+    peerDispatcher,
     ...(screenSecurity ? { screenSecurity } : {}),
     deploymentLayer,
     deploymentLayerStore,
@@ -2240,6 +2340,7 @@ export function serverDeps(
     egressAudit: built.egressAudit,
     sessions: built.sessions,
     peerIdentity: built.peerIdentity,
+    peerBoard: built.peerBoard,
     auditLog: built.auditLog,
     errors: built.errors,
     metrics: built.metrics,

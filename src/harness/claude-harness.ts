@@ -1,4 +1,5 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { createPeerInputReceipts } from "./peer-input-receipts.ts";
 import { spawn } from "node:child_process";
 import { chownSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -351,6 +352,9 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
     const turnEffort = effort(turn.runtime?.effortLevel);
     const text = promptText(turn);
     const initial = userMessage(text, turn.images);
+    const peerInputs = createPeerInputReceipts(turn.onPeerInputAccepted);
+    const echoedInputs = new Set<string>();
+    let allPromptsSucceeded = true;
     let pendingPrompts = 1;
     let stopped = false;
     let result: SDKResultMessage | null = null;
@@ -468,15 +472,21 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
             turn.runId,
             {
               onAbort: async () => interrupt(true),
-              onSteer: async (steer, ts) => {
+              onSteer: async (steer, ts, peerOrigin) => {
                 await turn.emit({
                   type: "user",
-                  payload: { text: steer, ...(ts ? { ts } : {}), steered: true },
+                  payload: { text: steer, ...(ts ? { ts } : {}), steered: true, ...(peerOrigin ? { peerOrigin } : {}) },
                   scopeLabel: turn.scopeLabel,
                 });
                 steerPrompts.push(steer);
                 pendingPrompts++;
-                queue.push(userMessage(steer));
+                const message = userMessage(steer);
+                if (peerOrigin) {
+                  message.uuid = randomUUID();
+                  message.origin = { kind: "peer", from: peerOrigin.senderSessionId, name: peerOrigin.senderName };
+                  peerInputs.add(message.uuid, peerOrigin, steer);
+                }
+                queue.push(message);
               },
             },
             { onError: (error) => swallow("claude signal poll", error) },
@@ -543,6 +553,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       const consume = (async () => {
         for await (const message of sdkQuery) {
           if (settled) break;
+          if (message.type === "user" && message.uuid) echoedInputs.add(message.uuid);
           if (message.type === "assistant") {
             const usage = message.message.usage;
             const seen = {
@@ -642,6 +653,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
             turn.onDelta?.(delta.text);
           }
           if (message.type !== "result") continue;
+          allPromptsSucceeded &&= message.subtype === "success" && !message.is_error;
           result = message;
           await recordStep(message);
           await flushThinking();
@@ -730,6 +742,8 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
         throw new Error(finalResult.errors.join("; ") || `Claude Agent SDK failed: ${finalResult.subtype}`);
       }
       const terminal = ref.runtimeHandoff || ref.silentRequested || ref.pausedOnApproval;
+      if (allPromptsSucceeded && pendingPrompts === 0 && !terminal && !stopped && !controller.signal.aborted)
+        for (const uuid of echoedInputs) await peerInputs.accepted(uuid);
       const reply = terminal ? "" : finalResult.result.trim();
       const usageTotals = [...callUsage.values()].reduce(
         (acc, usage) => {
