@@ -23,6 +23,32 @@ const onPath = (m: string, p: string) => (method: string, pathname: string) => m
 const FAMILIES: AgentApiFamily[] = [
   {
     match: (m, p) =>
+      (m === "POST" && p === "/v1/peer-spawns") ||
+      (m === "GET" && /^\/v1\/peers\/[^/]+\/subtree$/.test(p)) ||
+      (m === "PUT" && /^\/v1\/peers\/[^/]+\/subtree-limit$/.test(p)),
+    guidance:
+      "Spawn independent QM sessions with fresh computers and a task brief. Parent identity is derived from your live capability. Retries must reuse idempotencyKey. Every ancestor's recursive limit applies; stopped or archived descendants still count. No workspace or conversation copying.",
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/peer-spawns",
+        summary:
+          "reserve a child with {task,name,character?,idempotencyKey}; provisioning and initial-task delivery recover in the background",
+      },
+      {
+        method: "GET",
+        path: "/v1/peers/:id/subtree",
+        summary: "inspect public peer identity and recursive descendant count/cap",
+      },
+      {
+        method: "PUT",
+        path: "/v1/peers/:id/subtree-limit",
+        summary: "lower your own descendant cap with {limit}; raising limits or exceeding existing counts is refused",
+      },
+    ],
+  },
+  {
+    match: (m, p) =>
       (m === "GET" && /^\/v1\/peer-messages(?:\/[^/]+)?$/.test(p)) ||
       (m === "POST" && (p === "/v1/peer-messages" || p === "/v1/peer-messages/preview")),
     guidance:

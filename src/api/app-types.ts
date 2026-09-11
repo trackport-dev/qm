@@ -556,6 +556,7 @@ export interface App {
 }
 
 export interface AppDeps {
+  execution?: import("../runs/worker.ts").RunExecutionAdmission;
   identity: IdentityService;
   publicWebUrl?: string;
   sessions: SessionStore;

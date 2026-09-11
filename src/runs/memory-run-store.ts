@@ -70,7 +70,7 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
 
     async claim(workerId, ttlMs) {
       const pending = [...runs.values()]
-        .filter((r) => r.status === "pending" && !sessionHasRunning(r.sessionId))
+        .filter((r) => r.status === "pending" && (r.availableAt ?? 0) <= Date.now() && !sessionHasRunning(r.sessionId))
         .sort((a, b) => a.createdAt - b.createdAt);
       const run = pending[0];
       if (!run) return null;
@@ -79,10 +79,24 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
 
     async claimById(runId, workerId, ttlMs) {
       const run = runs.get(runId);
-      if (!run || run.status !== "pending" || sessionHasRunning(run.sessionId)) return null;
+      if (!run || run.status !== "pending" || (run.availableAt ?? 0) > Date.now() || sessionHasRunning(run.sessionId))
+        return null;
       return lease(run, workerId, ttlMs);
     },
 
+    async defer(runId, leaseToken, delayMs) {
+      if (!Number.isSafeInteger(delayMs) || delayMs < 1 || delayMs > 60_000) throw new Error("invalid run deferral");
+      const run = runs.get(runId);
+      if (!run || run.status !== "running" || run.leaseToken !== leaseToken) return false;
+      run.status = "pending";
+      run.leaseToken = null;
+      run.leaseExpiresAt = null;
+      run.workerId = null;
+      run.availableAt = Date.now() + delayMs;
+      if (run.attempts <= 1) run.startedAt = null;
+      run.attempts = Math.max(0, run.attempts - 1);
+      return true;
+    },
     async heartbeat(runId, leaseToken, ttlMs) {
       const run = runs.get(runId);
       if (!run || run.status !== "running" || run.leaseToken !== leaseToken) return false;

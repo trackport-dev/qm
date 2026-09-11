@@ -677,6 +677,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
           if (pendingPrompts === 0) queue.close();
         }
       })();
+      turn.onExecutionPending?.(consume);
       try {
         await (wallMs > 0
           ? Promise.race([

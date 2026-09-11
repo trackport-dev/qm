@@ -198,7 +198,15 @@ test("OpenCode records real usage, cost, and timings for each captured model cal
   });
   const entries: SessionEntry[] = [];
   const llmRows: HarnessLlmRequestRecord[] = [];
-  const result = await harness.turns.runTurn(turnInput(entries, llmRows));
+  const operations: Promise<void>[] = [];
+  const result = await harness.turns.runTurn({
+    ...turnInput(entries, llmRows),
+    onExecutionPending(operation) {
+      operations.push(operation);
+    },
+  });
+  assert.equal(operations.length, 1);
+  await Promise.all(operations);
   assert.equal(result.reply, "hello from fake");
   assert.equal(result.modelCalls, 1);
   assert.equal(llmRows.length, 1);

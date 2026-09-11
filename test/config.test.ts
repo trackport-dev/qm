@@ -20,6 +20,18 @@ const productionEnv = {
   SANDBOX_BACKEND: "local",
 } as const;
 
+test("coordination execution limits have bounded integer configuration", () => {
+  const defaults = loadConfig({});
+  assert.equal(defaults.coordinationConcurrency, 4);
+  assert.equal(defaults.coordinationTurnLimit, 200);
+  const configured = loadConfig({ COORDINATION_CONCURRENCY: "2", COORDINATION_TURN_LIMIT: "50" });
+  assert.equal(configured.coordinationConcurrency, 2);
+  assert.equal(configured.coordinationTurnLimit, 50);
+  for (const name of ["COORDINATION_CONCURRENCY", "COORDINATION_TURN_LIMIT"])
+    for (const value of ["0", "-1", "1.5", "NaN", "9007199254740992"])
+      assert.throws(() => loadConfig({ [name]: value }), new RegExp(name));
+});
+
 test("ORG_BRAND_* parses into a validated branding default", () => {
   assert.equal(loadConfig({}).brandingDefault, undefined);
   assert.deepEqual(

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { assertSessionReservation } from "./session-store.ts";
+import { reservedOrRandomId } from "../util/reserved-id.ts";
 import type { Session, SessionEntry, ScopeId } from "../types.ts";
 import type {
   AttributedTurn,
@@ -119,18 +121,21 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
 
   return {
     leaseTtlMs,
-    async getOrCreateByThread(threadRef, type, scopeId, channelName, surface) {
+    async getOrCreateByThread(threadRef, type, scopeId, channelName, surface, reservedId) {
+      const id = reservedOrRandomId(reservedId);
       const existingId = byThread.get(threadRef);
       if (existingId) {
         const s = sessions.get(existingId);
         if (s) {
+          assertSessionReservation(s, reservedId, type, scopeId);
           if (channelName && s.channelName !== channelName) s.channelName = channelName;
           if (surface && !s.surface) s.surface = surface;
           return s;
         }
       }
+      if (sessions.has(id)) throw new Error("session reservation conflicts with existing session");
       const session: Session = {
-        id: randomUUID(),
+        id,
         type,
         scopeId,
         threadRef,

@@ -47,6 +47,26 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.board-tree,
+.board-tree ul {
+  list-style: none;
+  padding-left: 18px;
+}
+.board-tree-node {
+  border-left: 1px solid var(--border);
+  padding: 10px 14px;
+  overflow-wrap: anywhere;
+}
+.board-tree-node small {
+  display: block;
+  margin: 6px 0;
+}
+.board-tree-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
 .agent-board pre {
   overflow: auto;
   max-height: 360px;

@@ -2,6 +2,16 @@ import { createHash } from "node:crypto";
 import type { EntryType, ScopeId, Session, SessionEntry, SessionType } from "../types.ts";
 import { sleep } from "../util/async.ts";
 
+export function assertSessionReservation(
+  session: Session,
+  reservedId: string | undefined,
+  type: SessionType,
+  scopeId: ScopeId,
+): void {
+  if (reservedId !== undefined && (session.id !== reservedId || session.type !== type || session.scopeId !== scopeId))
+    throw new Error("session reservation conflicts with existing session");
+}
+
 export function promptEnvelopeBody(envelope: unknown): { hash: string; body: string } | null {
   if (envelope == null) return null;
   let body: string;
@@ -652,6 +662,7 @@ export interface SessionStore {
     scopeId: ScopeId,
     channelName?: string,
     surface?: string,
+    reservedId?: string,
   ): Promise<Session>;
   getByThread(threadRef: string): Promise<Session | null>;
   get(sessionId: string): Promise<Session | null>;

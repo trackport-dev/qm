@@ -204,6 +204,47 @@ for (const failure of ["crash", "provider-error"]) {
   });
 }
 
+test("timed-out SDK consumption remains tracked until it actually settles", async () => {
+  let finish!: () => void;
+  const operation = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  currentScript = async function* (prompts) {
+    await prompts[Symbol.asyncIterator]().next();
+    await operation;
+    yield resultMessage("done");
+  };
+  let tracked: Promise<void> | undefined;
+  const harness = createClaudeHarness({});
+  const { turn } = harnessTurn({
+    turnWallClockMs: 10,
+    onExecutionPending(pending) {
+      tracked = pending;
+    },
+  });
+  try {
+    await assert.rejects(harness.turns.runTurn(turn), /wall clock/);
+    assert.ok(tracked);
+    let settled = false;
+    void tracked.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await Promise.resolve();
+    assert.equal(settled, false);
+    finish();
+    await tracked.catch(() => {});
+    assert.equal(settled, true);
+  } finally {
+    finish();
+    await harness.turns.close?.();
+  }
+});
+
 test("a user stop that surfaces as a non-success SDK result is a clean stop, and the stop stays pending", async () => {
   const signals = createMemoryRunSignalStore();
   const runId = "run-stop-error";

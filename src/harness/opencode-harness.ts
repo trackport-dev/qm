@@ -1003,6 +1003,7 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
         path: { id: sessionId },
         body: { model, agent: "qm", system: turn.systemPrompt, tools: enabled, parts: promptParts as never },
       });
+      turn.onExecutionPending?.(request.then(() => {}));
       const response =
         wallMs > 0
           ? await Promise.race([

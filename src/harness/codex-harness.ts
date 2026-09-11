@@ -1136,6 +1136,18 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       if (turn.cancel) turnStartSignals.push(turn.cancel);
       const turnStartTimeoutMs = deadline ? Math.max(1, deadline - Date.now()) : CODEX_START_TIMEOUT_MS;
       let turnStartTimer: NodeJS.Timeout | undefined;
+      if (turn.onExecutionPending) {
+        const stopped = new Promise<void>((resolveStopped) => {
+          const finish = () => {
+            rt.server.process.removeListener("close", finish);
+            resolveStopped();
+          };
+          rt.server.process.once("close", finish);
+          void completed.then(finish, () => {});
+          if (rt.server.process.exitCode !== null || rt.server.process.signalCode !== null) finish();
+        });
+        turn.onExecutionPending(stopped);
+      }
       const response = await Promise.race([
         rt.server.request<{ turn: CodexTurn }>(
           "turn/start",

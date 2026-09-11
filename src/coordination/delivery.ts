@@ -4,9 +4,10 @@ import type { PeerDelivery } from "./types.ts";
 
 export function createPeerDeliveryLedger(repository: CoordinationRepository) {
   return {
-    async claim(id: string, now = Date.now(), leaseMs = 30_000): Promise<PeerDelivery | null> {
+    async claim(id: string, at?: number, leaseMs = 30_000): Promise<PeerDelivery | null> {
       if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) throw new Error("invalid delivery lease duration");
       return repository.transaction([`delivery:${id}`], async (tx) => {
+        const now = at ?? Date.now();
         const current = await tx.get("delivery", id);
         if (!current || current.state === "consumed" || current.state === "failed" || current.leaseUntil > now)
           return null;
@@ -22,8 +23,9 @@ export function createPeerDeliveryLedger(repository: CoordinationRepository) {
         return delivery;
       });
     },
-    async bind(id: string, leaseToken: string, runId: string, now = Date.now()): Promise<boolean> {
+    async bind(id: string, leaseToken: string, runId: string, at?: number): Promise<boolean> {
       return repository.transaction([`delivery:${id}`], async (tx) => {
+        const now = at ?? Date.now();
         const current = await tx.get("delivery", id);
         if (!current || current.leaseToken !== leaseToken || current.leaseUntil <= now || current.state === "consumed")
           return false;
@@ -37,9 +39,10 @@ export function createPeerDeliveryLedger(repository: CoordinationRepository) {
       leaseToken: string,
       state: "queued" | "delivered" | "blocked" | "failed",
       reason: string | null = null,
-      now = Date.now(),
+      at?: number,
     ): Promise<boolean> {
       return repository.transaction([`delivery:${id}`], async (tx) => {
+        const now = at ?? Date.now();
         const current = await tx.get("delivery", id);
         if (!current || current.leaseToken !== leaseToken || current.leaseUntil <= now || current.state === "consumed")
           return false;
@@ -48,8 +51,9 @@ export function createPeerDeliveryLedger(repository: CoordinationRepository) {
         return true;
       });
     },
-    async consume(id: string, recipientId: string, runId: string, now = Date.now()): Promise<boolean> {
+    async consume(id: string, recipientId: string, runId: string, at?: number): Promise<boolean> {
       return repository.transaction([`delivery:${id}`], async (tx) => {
+        const now = at ?? Date.now();
         const current = await tx.get("delivery", id);
         if (!current || current.recipientId !== recipientId || current.runId !== runId || current.state === "failed")
           return false;

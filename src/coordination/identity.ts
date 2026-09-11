@@ -26,7 +26,7 @@ export function characterObject(input: unknown): Character {
   return decoded as Character;
 }
 
-function peerName(name: string): string {
+export function peerName(name: string): string {
   const value = name.trim();
   if (!value || value.length > 120 || /[\u0000-\u001f]/.test(value))
     throw new CoordinationError(400, "invalid_name", "name must contain 1–120 printable characters");

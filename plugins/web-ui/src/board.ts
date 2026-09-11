@@ -46,6 +46,24 @@ interface Preview {
   candidates: Candidate[];
   recipientIds: string[];
 }
+interface TreeNode {
+  peer: { id: string; parentId: string | null; name: string; state: string; character: Record<string, unknown> };
+  count: number;
+  cap: number;
+  sessionId?: string;
+  spawn?: { state: string; attempts: number; updatedAt: number; reason: string | null };
+}
+interface Tree {
+  nodes: TreeNode[];
+  manageable: boolean;
+  execution?: {
+    activeInScope: number;
+    orphanedInScope: number;
+    autonomousTurns: number;
+    concurrencyLimit: number;
+    turnLimit: number;
+  };
+}
 
 const filterNames = [
   ["text", "Search messages"],
@@ -68,15 +86,91 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
   let busy = false;
   let generation = 0;
   let notice = "";
+  let connectionNotice = "";
   let selected = parseDeepLink(UI_BASE, location.pathname, location.search).item;
   let detail: Detail | null = null;
   let expression = '.[] | select(.group == "new-feature" and .role == "worker")';
   let preview: Preview | null = null;
+  let treeRoot = "";
+  let tree: Tree | null = null;
+  let controlling = false;
   const filters = new URLSearchParams();
   const active = () => host.isConnected && appState.currentView === "board";
   const json = (value: unknown) => JSON.stringify(value, null, 2);
   const stamp = (at: number) => new Date(at).toLocaleString();
   const permalink = (id: string) => deepLinkPath(UI_BASE, "board", null, null, id);
+  async function loadTree(id: string): Promise<void> {
+    if (treeRoot !== id) tree = null;
+    treeRoot = id;
+    try {
+      const result = await request<Tree>(`/api/peers/${encodeURIComponent(id)}/subtree`);
+      if (treeRoot === id && active()) tree = result;
+    } catch (error) {
+      notice = errMessage(error);
+    }
+    paint();
+  }
+  async function control(id: string, action: string, subtree: boolean): Promise<void> {
+    if (controlling) return;
+    controlling = true;
+    paint();
+    try {
+      await request(`/api/peers/${encodeURIComponent(id)}/lifecycle`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action, subtree }),
+      });
+      notice = `${action} requested for ${subtree ? "subtree" : "agent"}. History and capacity counts are preserved.`;
+      await loadTree(treeRoot);
+    } catch (error) {
+      notice = errMessage(error);
+    } finally {
+      controlling = false;
+      paint();
+    }
+  }
+  function treeNode(node: TreeNode): ReturnType<typeof html> {
+    return html`<li class="board-tree-node">
+      <strong>${node.peer.name}</strong> · ${node.peer.state} · ${node.count}/${node.cap} descendants
+      ${
+        node.spawn
+          ? html`<p>
+                Provisioning: ${node.spawn.state} · ${node.spawn.attempts} attempts · ${stamp(node.spawn.updatedAt)}
+              </p>
+              ${node.spawn.reason ? html`<p role="status">${node.spawn.reason.replaceAll("_", " ")}</p>` : nothing}`
+          : nothing
+      }
+      <small>${node.peer.id}</small>
+      ${node.sessionId ? html`<a href=${withBase(`/s/${encodeURIComponent(node.sessionId)}`)}>Open session activity</a>` : nothing}
+      <details>
+        <summary>Character</summary>
+        <pre>${json(node.peer.character)}</pre>
+      </details>
+      ${
+        tree?.manageable
+          ? html`<form
+              class="board-tree-controls"
+              @submit=${(event: SubmitEvent) => {
+                event.preventDefault();
+                const action = (event.submitter as HTMLButtonElement)?.value;
+                if (action)
+                  void control(
+                    node.peer.id,
+                    action,
+                    new FormData(event.currentTarget as HTMLFormElement).has("subtree"),
+                  );
+              }}
+            >
+              <label><input type="checkbox" name="subtree" /> Include descendants</label>
+              ${["pause", "resume", "stop"].map((action) => html`<button class="btn" type="submit" value=${action} ?disabled=${controlling || node.peer.state === "archived"}>${action}</button>`)}
+            </form>`
+          : nothing
+      }
+      <ul>
+        ${tree?.nodes.filter((child) => child.peer.parentId === node.peer.id).map(treeNode)}
+      </ul>
+    </li>`;
+  }
 
   async function select(id: string): Promise<void> {
     selected = id;
@@ -116,10 +210,10 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
       for (const message of page.messages) messages.set(message.id, message);
       cursor = page.nextCursor;
       more = page.hasMore;
-      notice = "";
+      connectionNotice = "";
     } catch (error) {
       if (version === generation)
-        notice = `Connection interrupted: ${errMessage(error)}. Retrying from the last cursor.`;
+        connectionNotice = `Connection interrupted: ${errMessage(error)}. Retrying from the last cursor.`;
     } finally {
       if (version === generation) {
         busy = false;
@@ -168,7 +262,67 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
           ${filterNames.map(([key, label]) => html`<label>${label}<input name=${key} type=${key === "text" ? "search" : "text"} /></label>`)}
           <button class="btn" type="submit">Apply filters</button>
         </form>
-        ${notice ? html`<p role="status">${notice}</p>` : nothing}
+        ${connectionNotice ? html`<p role="status">${connectionNotice}</p>` : nothing}
+        ${
+          notice
+            ? html`<div role="status">
+                <p>${notice}</p>
+                <button
+                  class="btn"
+                  @click=${() => {
+                    notice = "";
+                    paint();
+                  }}
+                >
+                  Dismiss notice
+                </button>
+              </div>`
+            : nothing
+        }
+        <section aria-label="Spawn tree">
+          <h2>Spawn tree</h2>
+          <form
+            class="board-filters"
+            @submit=${(event: SubmitEvent) => {
+              event.preventDefault();
+              const id = String(new FormData(event.currentTarget as HTMLFormElement).get("agent") ?? "").trim();
+              if (id) void loadTree(id);
+            }}
+          >
+            <label>Agent or subtree root ID<input name="agent" .value=${treeRoot} required /></label>
+            <button class="btn" type="submit">Inspect subtree</button>
+          </form>
+          <p>
+            All descendants count, including idle and archived agents. Stopping an agent does not stop its descendants
+            unless selected.
+          </p>
+          ${
+            tree
+              ? html` ${
+                    tree.execution
+                      ? html`<p>
+                            Scope execution capacity:
+                            ${tree.execution.activeInScope}/${tree.execution.concurrencyLimit}. Root autonomous turns:
+                            ${tree.execution.autonomousTurns}/${tree.execution.turnLimit}. Human turns do not spend the
+                            autonomous budget.
+                          </p>
+                          ${
+                            tree.execution.orphanedInScope
+                              ? html`<p role="status">
+                                  ${tree.execution.orphanedInScope} orphaned execution permit(s) still consume scope
+                                  capacity. The old run no longer owns its lease; execution termination has not been
+                                  confirmed.
+                                </p>`
+                              : ""
+                          }`
+                      : ""
+                  }
+                  <ul class="board-tree">
+                    ${tree.nodes.filter((node) => !tree!.nodes.some((parent) => parent.peer.id === node.peer.parentId)).map(treeNode)}
+                  </ul>`
+              : nothing
+          }
+        </section>
         <div class="board-columns">
           <section aria-label="Message timeline" aria-busy=${busy}>
             ${messages.size === 0 ? html`<p>${busy ? "Loading messages…" : "No matching messages."}</p>` : nothing}
@@ -205,6 +359,9 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
                     <h2>Message inspector</h2>
                     <a href=${permalink(detail.message.id)}>Permalink</a>
                     <p>Sender: ${detail.message.senderName} (${detail.message.senderId})</p>
+                    <button class="btn" @click=${() => void loadTree(detail!.message.senderId)}>
+                      Inspect sender subtree
+                    </button>
                     <p class="board-text">${detail.message.text}</p>
                     ${detail.message.replyTo ? html`<button class="btn" @click=${() => void select(detail!.message.replyTo!)}>Inspect parent reply</button>` : nothing}
                     <button
@@ -266,7 +423,7 @@ export async function renderBoardPage(request: typeof api = api): Promise<void> 
   }
   async function poll(): Promise<void> {
     if (!active()) return;
-    await Promise.all([refresh(), loadDetail()]);
+    await Promise.all([refresh(), loadDetail(), ...(treeRoot ? [loadTree(treeRoot)] : [])]);
     if (active()) setTimeout(() => void poll(), 3_000);
   }
   await poll();

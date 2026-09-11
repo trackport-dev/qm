@@ -49,6 +49,8 @@ export interface Config {
   securityPosture: SecurityPosture;
   sandboxResourcesEnabled: boolean;
   coordinationEnabled: boolean;
+  coordinationConcurrency: number;
+  coordinationTurnLimit: number;
   sharingPosture: SharingPosture;
   sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
   sandboxSecondaryBackend?: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
@@ -986,6 +988,13 @@ function modelProviderEnvStrict(env: NodeJS.ProcessEnv): ModelProvider | undefin
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const coordinationConcurrency = numEnvStrict("COORDINATION_CONCURRENCY", env.COORDINATION_CONCURRENCY) ?? 4;
+  const coordinationTurnLimit = numEnvStrict("COORDINATION_TURN_LIMIT", env.COORDINATION_TURN_LIMIT) ?? 200;
+  for (const [name, value] of Object.entries({
+    COORDINATION_CONCURRENCY: coordinationConcurrency,
+    COORDINATION_TURN_LIMIT: coordinationTurnLimit,
+  }))
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive safe integer`);
   const harness = harnessEnvStrict(env.HARNESS);
   const codexAuthCredential = env.CODEX_AUTH_CREDENTIAL?.trim() || undefined;
   const claudeAuthCredential = env.CLAUDE_AUTH_CREDENTIAL?.trim() || undefined;
@@ -1233,6 +1242,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxBackend,
     sandboxResourcesEnabled: boolEnvStrict("SANDBOX_RESOURCES_ENABLED", env.SANDBOX_RESOURCES_ENABLED) ?? false,
     coordinationEnabled: boolEnvStrict("COORDINATION_ENABLED", env.COORDINATION_ENABLED) ?? false,
+    coordinationConcurrency,
+    coordinationTurnLimit,
     deployProvider,
     ...(env.EGRESS_SERVICE_HOSTS
       ? {

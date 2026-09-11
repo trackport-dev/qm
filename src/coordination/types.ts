@@ -80,9 +80,16 @@ export interface PeerDelivery {
 export interface PeerSpawn {
   id: string;
   parentId: string;
+  parentRunId: string;
+  backend: import("../sandbox/sandbox-routing.ts").SandboxBackendName;
   childId: string;
   rootId: string;
   task: string;
+  initialName: string;
+  initialCharacter: Character;
+  leaseToken: string | null;
+  leaseUntil: number;
+  attempts: number;
   state: "reserved" | "provisioning" | "ready" | "failed";
   sandboxId: string | null;
   runId: string | null;
@@ -103,6 +110,28 @@ export interface PeerWait {
   deadline: number;
   createdAt: number;
   resumeRunId: string | null;
+}
+
+export type PublicSpawn = Pick<PeerSpawn, "id" | "state" | "attempts" | "createdAt" | "updatedAt" | "reason">;
+
+export function publicSpawn(spawn: PeerSpawn): PublicSpawn {
+  const reasons = new Set([
+    "spawn_parent_unavailable",
+    "spawn_child_unavailable",
+    "execution_authority_revoked",
+    "spawn_scope_changed",
+    "spawn_dispatch_pending",
+    "spawn_provisioning_failed",
+    "spawn_lease_lost",
+  ]);
+  return {
+    id: spawn.id,
+    state: spawn.state,
+    attempts: spawn.attempts,
+    createdAt: spawn.createdAt,
+    updatedAt: spawn.updatedAt,
+    reason: spawn.reason && (reasons.has(spawn.reason) ? spawn.reason : "spawn_provisioning_failed"),
+  };
 }
 
 export interface CoordinationRows {

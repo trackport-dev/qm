@@ -360,6 +360,46 @@ const call = (tool: ReturnType<typeof createAgentTools>[number] | undefined, par
   return (tool.execute as unknown as (id: string, p: unknown) => Promise<unknown>)("t", params);
 };
 
+test("tool execution tracking remains pending until the tool body exits", async () => {
+  let finish!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const context = fakeToolContext();
+  context.execute = async () => {
+    entered();
+    await gate;
+    return { stdout: "done", stderr: "", code: 0, timedOut: false };
+  };
+  const operations: Promise<void>[] = [];
+  const tools = createAgentTools({
+    current: context,
+    onExecutionPending(operation) {
+      operations.push(operation);
+    },
+  });
+  const running = call(
+    tools.find((tool) => tool.name === "execute"),
+    { command: "work" },
+  );
+  await started;
+  assert.equal(operations.length, 1);
+  let settled = false;
+  void operations[0]!.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  finish();
+  await running;
+  await Promise.all(operations);
+  assert.equal(settled, true);
+});
+
 test("miniapp stays unavailable while playground rendering is deferred", () => {
   for (const surfaceName of [undefined, "web", "slack"]) {
     assert.equal(

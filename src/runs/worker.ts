@@ -12,10 +12,16 @@ import { sleep } from "../util/async.ts";
 
 export interface ProcessDeps {
   runs: RunStore;
-  orchestrator: Orchestrator;
+  orchestrator: Pick<Orchestrator, "handleTurn">;
   leaseTtlMs: number;
   heartbeatIntervalMs?: number;
   errors?: ErrorLog;
+  execution?: RunExecutionAdmission;
+}
+
+export interface RunExecutionAdmission {
+  admit(run: Run): Promise<"admitted" | "concurrency_limit" | "turn_limit" | "attempt_busy">;
+  release(run: Run): Promise<void>;
 }
 
 export const LEASE_LOST_CONSECUTIVE = 3;
@@ -58,7 +64,17 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
     beatStopped = true;
     clearInterval(beat);
   };
+  let admitted = false;
+  const pendingExecutions = new Set<Promise<void>>();
   try {
+    const admission = (await deps.execution?.admit(run)) ?? "admitted";
+    if (admission === "turn_limit") throw new NonRetryableTurnError("Autonomous turn limit reached.");
+    if (admission !== "admitted") {
+      if (!(await deps.runs.defer(run.id, token, 1_000)))
+        throw new Error(`run ${run.id} lost its lease before admission deferral`);
+      return { status: "queued", runId: run.id, reason: admission };
+    }
+    admitted = true;
     const queueMs = run.startedAt !== null ? Math.max(0, run.startedAt - run.createdAt) : undefined;
     const result = await deps.orchestrator.handleTurn({
       ...run.request,
@@ -68,6 +84,14 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
       finalAttempt: errorParks(run, deps.runs.maxClaims),
       background: opts?.background ?? false,
       cancel: cancel.signal,
+      onExecutionPending(operation) {
+        const settled = operation.then(
+          () => {},
+          () => {},
+        );
+        pendingExecutions.add(settled);
+        void settled.then(() => pendingExecutions.delete(settled));
+      },
       ...(queueMs !== undefined ? { queueMs } : {}),
       ...(run.startedAt !== null ? { runStartedAt: run.startedAt } : {}),
     });
@@ -92,6 +116,16 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
     throw err;
   } finally {
     stopBeat();
+    if (admitted && deps.execution) {
+      const release = () =>
+        deps.execution!.release(run).catch((err) => swallow("worker: execution permit release failed", err));
+      if (pendingExecutions.size) {
+        void (async () => {
+          while (pendingExecutions.size) await Promise.all(pendingExecutions);
+          await release();
+        })();
+      } else await release();
+    }
   }
 }
 

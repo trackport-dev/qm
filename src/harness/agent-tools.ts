@@ -45,6 +45,7 @@ function describePublishAudience(a: PublishAudienceDescriptor | undefined): stri
 }
 
 export interface ToolContextRef {
+  onExecutionPending?(operation: Promise<void>): void;
   runtimeHandoff?: RuntimeHandoff;
   runtimeRunId?: string;
   runtimeActorId?: string;
@@ -3705,7 +3706,11 @@ function withToolBodyTiming(tool: ToolDefinition, ref: ToolContextRef): ToolDefi
     async execute(callId: string, params: unknown) {
       const start = Date.now();
       try {
-        return await (inner as (callId: string, params: unknown) => unknown)(callId, params);
+        const operation = Promise.resolve().then(() =>
+          (inner as (callId: string, params: unknown) => unknown)(callId, params),
+        );
+        ref.onExecutionPending?.(operation.then(() => {}));
+        return await operation;
       } finally {
         try {
           ref.onGapWork?.({ phase: "tool_body", tool: tool.name, start, end: Date.now() });

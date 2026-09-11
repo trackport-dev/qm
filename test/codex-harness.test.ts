@@ -463,7 +463,11 @@ test("Codex harness drives app-server JSON-RPC with a read-only jail", async (t)
   const modelCalls: number[] = [];
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;
   const session = { id: "session-1" } as Session;
+  const operations: Promise<void>[] = [];
   const result = await harness.turns.runTurn({
+    onExecutionPending(operation) {
+      operations.push(operation);
+    },
     session,
     input: "hi",
     systemPrompt: "be concise",
@@ -481,6 +485,8 @@ test("Codex harness drives app-server JSON-RPC with a read-only jail", async (t)
   });
 
   assert.equal(result.reply, "hello");
+  assert.equal(operations.length, 1);
+  await Promise.all(operations);
   assert.deepEqual(deltas, ["hello"]);
   assert.deepEqual(modelCalls, [100, 70, 150]);
   assert.deepEqual(
@@ -879,6 +885,7 @@ test("Codex rejects unknown JSON-RPC response ids", async (t) => {
 });
 
 test("Codex rejects malformed turn completion payloads", async (t) => {
+  let pending: Promise<void> | undefined;
   const dir = mkdtempSync(join(tmpdir(), "qm-codex-malformed-turn-test-"));
   const harness = createCodexHarness({
     binaryPath: malformedTurnCompletedCodexBinary(dir),
@@ -892,6 +899,9 @@ test("Codex rejects malformed turn completion payloads", async (t) => {
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;
   await assert.rejects(
     harness.turns.runTurn({
+      onExecutionPending(operation) {
+        pending = operation;
+      },
       session: { id: "malformed-turn" } as Session,
       input: "hi",
       systemPrompt: "be concise",
@@ -904,6 +914,16 @@ test("Codex rejects malformed turn completion payloads", async (t) => {
     }),
     /invalid turn\/completed payload/,
   );
+  assert.ok(pending);
+  let stopped = false;
+  void pending.then(() => {
+    stopped = true;
+  });
+  await Promise.resolve();
+  assert.equal(stopped, false);
+  await harness.turns.close?.();
+  await pending;
+  assert.equal(stopped, true);
 });
 
 test("Codex children cannot use parent surface, control, or terminal tools", () => {

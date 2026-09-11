@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { assertSessionReservation } from "./session-store.ts";
+import { reservedOrRandomId } from "../util/reserved-id.ts";
 import { createPgPool, type PgPool, type PoolClient, withPgTransaction } from "../persistence/pg-pool.ts";
 import { jsonbSafeStringify } from "../util/text.ts";
 import type { PeerOrigin, Session, SessionEntry, SessionType, ScopeId } from "../types.ts";
@@ -617,9 +619,11 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
 
   return {
     leaseTtlMs,
-    async getOrCreateByThread(threadRef, type, scopeId, channelName, surface): Promise<Session> {
+    async getOrCreateByThread(threadRef, type, scopeId, channelName, surface, reservedId): Promise<Session> {
+      const id = reservedOrRandomId(reservedId);
       const heal = async (row: Record<string, unknown>): Promise<Session> => {
         const s = rowToSession(row);
+        assertSessionReservation(s, reservedId, type, scopeId);
         if (channelName && s.channelName !== channelName) {
           await q("UPDATE sessions SET channel_name = $2 WHERE id = $1", [s.id, channelName]);
           s.channelName = channelName;
@@ -633,7 +637,7 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
       const existing = await q("SELECT * FROM sessions WHERE thread_ref = $1", [threadRef]);
       if (existing[0]) return heal(existing[0]);
       const session: Session = {
-        id: randomUUID(),
+        id,
         type,
         scopeId,
         threadRef,
@@ -642,7 +646,7 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
         ...(surface ? { surface } : {}),
       };
       await q(
-        "INSERT INTO sessions(id, type, scope_id, thread_ref, created_at, channel_name, surface, last_activity, messages, turns, origin, origin_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$5,0,0,$8,$9) ON CONFLICT (thread_ref) DO NOTHING",
+        "INSERT INTO sessions(id, type, scope_id, thread_ref, created_at, channel_name, surface, last_activity, messages, turns, origin, origin_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$5,0,0,$8,$9) ON CONFLICT DO NOTHING",
         [
           session.id,
           session.type,
@@ -656,6 +660,7 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
         ],
       );
       const rows = await q("SELECT * FROM sessions WHERE thread_ref = $1", [threadRef]);
+      if (!rows[0]) throw new Error("session reservation conflicts with existing session");
       return heal(rows[0]!);
     },
 

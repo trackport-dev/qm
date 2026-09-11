@@ -40,6 +40,7 @@ function rowToRun(r: Record<string, unknown>): Run {
     createdAt: Number(r.created_at),
     startedAt: r.started_at === null ? null : Number(r.started_at),
     finishedAt: r.finished_at === null ? null : Number(r.finished_at),
+    ...(Number(r.available_at) > 0 ? { availableAt: Number(r.available_at) } : {}),
   };
 }
 
@@ -142,6 +143,10 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
       END $$`,
         ],
       },
+      {
+        id: "runs/store/0005-admission-deferral",
+        statements: ["ALTER TABLE runs ADD COLUMN IF NOT EXISTS available_at BIGINT NOT NULL DEFAULT 0"],
+      },
     ],
   );
 
@@ -218,7 +223,7 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
           `UPDATE runs SET status='running', lease_token=$1, lease_expires_at=$2, worker_id=$3,
              attempts=attempts+1, started_at=COALESCE(started_at,$4)
            WHERE id = (
-             SELECT id FROM runs WHERE status='pending'
+             SELECT id FROM runs WHERE status='pending' AND available_at <= $4
                AND session_id NOT IN (SELECT session_id FROM runs WHERE status='running')
              ORDER BY created_at ASC, seq ASC FOR UPDATE SKIP LOCKED LIMIT 1
            ) RETURNING *`,
@@ -239,7 +244,7 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
           `UPDATE runs SET status='running', lease_token=$1, lease_expires_at=$2, worker_id=$3,
              attempts=attempts+1, started_at=COALESCE(started_at,$4)
            WHERE id = (
-             SELECT id FROM runs WHERE id=$5 AND status='pending'
+             SELECT id FROM runs WHERE id=$5 AND status='pending' AND available_at <= $4
                AND session_id NOT IN (SELECT session_id FROM runs WHERE status='running')
              FOR UPDATE SKIP LOCKED LIMIT 1
            ) RETURNING *`,
@@ -252,6 +257,16 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
       }
     },
 
+    async defer(runId, leaseToken, delayMs): Promise<boolean> {
+      if (!Number.isSafeInteger(delayMs) || delayMs < 1 || delayMs > 60_000) throw new Error("invalid run deferral");
+      const { rowCount } = await q(
+        `UPDATE runs SET status='pending', lease_token=NULL, lease_expires_at=NULL, worker_id=NULL,
+        available_at=$3, started_at=CASE WHEN attempts<=1 THEN NULL ELSE started_at END, attempts=GREATEST(0, attempts-1)
+        WHERE id=$1 AND lease_token=$2 AND status='running'`,
+        [runId, leaseToken, Date.now() + delayMs],
+      );
+      return rowCount > 0;
+    },
     async heartbeat(runId, leaseToken, ttlMs): Promise<boolean> {
       const { rowCount } = await q(
         "UPDATE runs SET lease_expires_at=$1 WHERE id=$2 AND lease_token=$3 AND status='running'",

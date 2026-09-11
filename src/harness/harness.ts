@@ -74,6 +74,7 @@ export interface HarnessTurnInput {
   session: Session;
   runId?: string;
   onPeerInputAccepted?(origin: PeerOrigin): Promise<void>;
+  onExecutionPending?(operation: Promise<void>): void;
   cancel?: AbortSignal;
   input: string;
   triggerTs?: string;

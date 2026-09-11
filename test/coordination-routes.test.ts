@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { buildApp, serverDeps } from "../src/wiring.ts";
 import { createServer } from "../src/api/server.ts";
 import { mintCapabilityToken } from "../src/auth/capability-token.ts";
+import { signedHeaders } from "../plugins/chassis/src/core-client.ts";
 import { testConfig, TEST_CAPABILITY_SECRET } from "./support/test-config.ts";
 import { scopeId } from "../src/types.ts";
 
@@ -90,6 +91,57 @@ test("peer routes expose public character, enforce session attribution, and pres
     idempotencyKey: "progress",
     senderId: "forged",
   };
+  const spawnRequest = {
+    task: "Build independently",
+    name: "Child",
+    character: { role: "worker" },
+    idempotencyKey: "child",
+    parentId: "forged",
+    parentRunId: "forged",
+    backend: "forged",
+  };
+  assert.equal((await post(bob, spawnRequest, "/v1/peer-spawns")).status, 403);
+  assert.equal((await post(forged, spawnRequest, "/v1/peer-spawns")).status, 403);
+  const spawned = await post(own, spawnRequest, "/v1/peer-spawns");
+  assert.equal(spawned.status, 200, await spawned.clone().text());
+  const operation = (
+    (await spawned.json()) as { spawn: { id: string; parentId: string; childId: string; state: string } }
+  ).spawn;
+  assert.equal(operation.parentId, session.id);
+  assert.equal(operation.state, "reserved");
+  const storedSpawn = await built.coordinationRepository.get("spawn", operation.id);
+  assert.equal(storedSpawn?.parentRunId, run.id);
+  assert.equal(storedSpawn?.backend, config.sandboxBackend);
+  const duplicateSpawn = await post(own, spawnRequest, "/v1/peer-spawns");
+  assert.deepEqual(await duplicateSpawn.json(), { spawn: operation });
+  const subtree = await request(`/v1/peers/${session.id}/subtree`, bob);
+  assert.equal(subtree.status, 200, await subtree.clone().text());
+  const subtreeBody = (await subtree.json()) as { count: number; cap: number; peer: Record<string, unknown> };
+  assert.equal(subtreeBody.count, 1);
+  assert.equal(subtreeBody.cap, 16);
+  assert.equal(subtreeBody.peer.authority, undefined);
+  assert.equal(subtreeBody.peer.sandboxId, undefined);
+  const lifecyclePath = `/v1/peers/${session.id}/lifecycle`;
+  assert.equal((await post(own, { action: "stop" }, lifecyclePath)).status, 403);
+  const humanAction = async (actor: string, action: string, subtree = false) => {
+    const path = `${lifecyclePath}?principalId=${actor}`;
+    const body = JSON.stringify({ action, subtree });
+    return fetch(base + path, {
+      method: "POST",
+      body,
+      headers: { ...signedHeaders(config.signingSecret, "POST", path, body), "content-type": "application/json" },
+    });
+  };
+  assert.equal((await humanAction("bob", "stop")).status, 403);
+  const paused = await humanAction("alice", "pause", true);
+  assert.equal(paused.status, 200, await paused.clone().text());
+  assert.equal((await built.coordinationRepository.get("peer", operation.childId))?.state, "paused");
+  assert.equal((await humanAction("alice", "resume", true)).status, 200);
+  assert.equal((await built.coordinationRepository.get("peer", operation.childId))?.state, "active");
+  assert.equal((await request(`/v1/peers/${operation.childId}/subtree-limit`, own, { limit: 0 })).status, 403);
+  assert.equal((await request(`/v1/peers/${session.id}/subtree-limit`, own, { limit: 0 })).status, 409);
+  assert.equal((await request(`/v1/peers/${session.id}/subtree-limit`, own, { limit: 1 })).status, 200);
+  assert.equal((await post(own, { ...spawnRequest, idempotencyKey: "overflow" }, "/v1/peer-spawns")).status, 409);
   const published = await post(own, publication);
   assert.equal(published.status, 200, await published.clone().text());
   const message = ((await published.json()) as { message: { id: string; senderId: string } }).message;

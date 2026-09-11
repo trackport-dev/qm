@@ -34,6 +34,7 @@ test("board proxy binds reads and previews to the authenticated viewer", async (
     "/api/peer-messages?principalId=mallory&after=17&text=review",
     "/api/peer-messages/message-id",
     "/api/peers",
+    "/api/peers/agent-id/subtree?principalId=mallory",
   ]) {
     const result = await fetch(base + path, { headers });
     assert.equal(result.status, 200);
@@ -49,5 +50,13 @@ test("board proxy binds reads and previews to the authenticated viewer", async (
   });
   assert.equal(preview.status, 200);
   assert.deepEqual(JSON.parse(seen.at(-1)!.body), { audience: ".[]" });
+  assert.equal(new URL(seen.at(-1)!.path, "http://core").searchParams.get("principalId"), "alice");
+  const control = await fetch(base + "/api/peers/agent-id/lifecycle?principalId=mallory", {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ action: "stop", subtree: true }),
+  });
+  assert.equal(control.status, 200);
+  assert.deepEqual(JSON.parse(seen.at(-1)!.body), { action: "stop", subtree: true });
   assert.equal(new URL(seen.at(-1)!.path, "http://core").searchParams.get("principalId"), "alice");
 });

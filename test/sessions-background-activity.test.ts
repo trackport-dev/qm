@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { buildApp } from "../src/wiring.ts";
 import type { TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
+import { supportsProcessSessions } from "../src/sandbox/sandbox.ts";
 
 function freshApp() {
   const dataDir = mkdtempSync(join(tmpdir(), "ap-bg-activity-"));
@@ -115,6 +116,29 @@ test("readSessionBackgroundOutput binds the job to the conversation, not just th
   assert.equal(await app.readSessionBackgroundOutput(r1.sessionId!, "p-other", "U1", 0), null);
   assert.equal(await app.readSessionBackgroundOutput(r2.sessionId!, "p-other", "U2", 0), null);
   assert.equal(await app.readSessionBackgroundOutput(r1.sessionId!, "p-ghost", "U1", 0), null);
+});
+
+test("background output follows the recorded computer instead of the scope default", async (t) => {
+  const { app, processes, sandbox } = freshApp();
+  const thread = "web:U1:dedicated";
+  const result = await app.turn(dm("inspect background work", thread));
+  assert.ok(supportsProcessSessions(sandbox));
+  await processes!.register({ ...registryRow("p-dedicated", thread), sandboxId: "child-computer" });
+  let provisions = 0;
+  t.mock.method(sandbox, "provision", async (...[_layers, options]: Parameters<typeof sandbox.provision>) => {
+    assert.equal(options?.sandboxId, "child-computer");
+    provisions++;
+    return { id: "dedicated", resourceId: "child-computer" };
+  });
+  t.mock.method(sandbox, "readProcess", async (...[handle, processId]: Parameters<typeof sandbox.readProcess>) => {
+    assert.equal(handle.resourceId, "child-computer");
+    assert.equal(processId, "p-dedicated");
+    return { chunks: "child output", cursor: 12, status: { state: "running" } };
+  });
+  t.mock.method(sandbox, "teardown", async () => {});
+  const output = await app.readSessionBackgroundOutput(result.sessionId!, "p-dedicated", "U1", 0);
+  assert.equal(provisions, 1);
+  assert.equal(output?.chunk, "child output");
 });
 
 function cronInput(target: string | undefined, action: string) {

@@ -1031,8 +1031,15 @@ export function emptyEndingNote(opts: {
 
 export async function raceTurnWallClock(
   prompting: Promise<void>,
-  opts: { capMs: number; graceMs?: number; abort: () => Promise<void>; extendMs?: () => number },
+  opts: {
+    capMs: number;
+    graceMs?: number;
+    abort: () => Promise<void>;
+    extendMs?: () => number;
+    onExecutionPending?(operation: Promise<void>): void;
+  },
 ): Promise<TurnWallClockOutcome> {
+  opts.onExecutionPending?.(prompting);
   if (!Number.isFinite(opts.capMs) || opts.capMs <= 0) {
     await prompting;
     return "ok";
@@ -1729,6 +1736,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
         try {
           const turnWallClockMs = turn.turnWallClockMs ?? defaultTurnWallClockMs;
           entry.ref.current = turn.tools;
+          entry.ref.onExecutionPending = turn.onExecutionPending;
           entry.ref.runtimeHandoff = undefined;
           entry.ref.runtimeMutationPending = false;
           entry.ref.runtimeInFlight = new Set();
@@ -2117,7 +2125,12 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
               entry.agentSession.prompt(
                 refusalFallbackNote(modelDisplayName(fromId!), modelDisplayName(fallbackId), refusal),
               ),
-              { capMs, extendMs: extendCapMs, abort: () => entry.agentSession.abort() },
+              {
+                capMs,
+                extendMs: extendCapMs,
+                abort: () => entry.agentSession.abort(),
+                onExecutionPending: turn.onExecutionPending,
+              },
             );
             if (userAborted) return false;
             if (outcome !== "ok") throw new NonRetryableTurnError(refusal);
@@ -2131,6 +2144,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
               entry.agentSession.prompt(modelPrompt, images ? { images } : undefined),
               {
                 capMs: raceCapMs(),
+                onExecutionPending: turn.onExecutionPending,
                 extendMs: extendCapMs,
                 abort: () => entry.agentSession.abort(),
               },
@@ -2172,6 +2186,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
                   if (turnWallClockMs > 0 && rawRemainingCapMs() < EMPTY_ENDING_MIN_BUDGET_MS)
                     return Promise.resolve<TurnWallClockOutcome>("aborted");
                   return raceTurnWallClock(entry.agentSession.prompt(note), {
+                    onExecutionPending: turn.onExecutionPending,
                     capMs: raceCapMs(),
                     extendMs: extendCapMs,
                     abort: () => entry.agentSession.abort(),
@@ -2216,6 +2231,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
               ) {
                 try {
                   const outcome = await raceTurnWallClock(entry.agentSession.prompt(note), {
+                    onExecutionPending: turn.onExecutionPending,
                     capMs,
                     extendMs: extendCapMs,
                     abort: () => entry.agentSession.abort(),

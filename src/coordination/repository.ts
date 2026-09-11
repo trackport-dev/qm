@@ -1,6 +1,13 @@
 import { createKeyedQueue } from "../util/async.ts";
 import { withPgTransaction, type PgPool, type PoolClient } from "../persistence/pg-pool.ts";
-import type { CoordinationEvent, CoordinationKind, CoordinationRows, PeerDelivery, PeerMessage } from "./types.ts";
+import type {
+  CoordinationEvent,
+  CoordinationKind,
+  CoordinationRows,
+  PeerDelivery,
+  PeerMessage,
+  PeerSpawn,
+} from "./types.ts";
 
 export interface PeerMessageQuery {
   after: number;
@@ -21,14 +28,17 @@ export interface PeerMessagePage {
 }
 
 export interface CoordinationRead {
+  livePeerIds(after: string, limit: number): Promise<string[]>;
   get<K extends CoordinationKind>(kind: K, id: string): Promise<CoordinationRows[K] | null>;
   list<K extends CoordinationKind>(kind: K, filter?: Partial<CoordinationRows[K]>): Promise<CoordinationRows[K][]>;
   events(after: number, limit: number): Promise<CoordinationEvent[]>;
   pendingDeliveries(now: number, limit: number): Promise<PeerDelivery[]>;
+  pendingSpawns(now: number, limit: number): Promise<PeerSpawn[]>;
   messagePage(query: PeerMessageQuery): Promise<PeerMessagePage>;
 }
 
 export interface CoordinationTransaction extends CoordinationRead {
+  sessionExists?(id: string): Promise<boolean>;
   put<K extends CoordinationKind>(kind: K, row: CoordinationRows[K]): Promise<void>;
   event(kind: CoordinationKind, id: string, at: number): Promise<number>;
 }
@@ -55,6 +65,14 @@ export function createMemoryCoordinationRepository(): CoordinationRepository {
   let events: CoordinationEvent[] = [];
   const queue = createKeyedQueue();
   const read = (data: MemoryRows, log: CoordinationEvent[]): CoordinationRead => ({
+    async livePeerIds(after, limit) {
+      eventWindow(0, limit);
+      return [...data.peer.values()]
+        .filter((peer) => peer.state !== "deleted" && Buffer.compare(Buffer.from(peer.id), Buffer.from(after)) > 0)
+        .map((peer) => peer.id)
+        .sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+        .slice(0, limit);
+    },
     async get(kind, id) {
       return structuredClone(data[kind].get(id) ?? null);
     },
@@ -79,6 +97,17 @@ export function createMemoryCoordinationRepository(): CoordinationRepository {
         [...data.delivery.values()]
           .filter((row) => row.state !== "consumed" && row.state !== "failed" && row.leaseUntil <= now)
           .sort((a, b) => a.updatedAt - b.updatedAt || a.id.localeCompare(b.id))
+          .slice(0, limit),
+      );
+    },
+    async pendingSpawns(now, limit) {
+      eventWindow(now, limit);
+      const eligibleAt = (spawn: PeerSpawn) =>
+        Math.max(spawn.leaseUntil, spawn.state === "failed" ? spawn.updatedAt + 5_000 : 0);
+      return structuredClone(
+        [...data.spawn.values()]
+          .filter((spawn) => spawn.state !== "ready" && eligibleAt(spawn) <= now)
+          .sort((a, b) => eligibleAt(a) - eligibleAt(b) || a.id.localeCompare(b.id))
           .slice(0, limit),
       );
     },
@@ -127,6 +156,8 @@ export function createMemoryCoordinationRepository(): CoordinationRepository {
     list: (kind, filter) => read(rows, events).list(kind, filter),
     events: (after, limit) => read(rows, events).events(after, limit),
     pendingDeliveries: (now, limit) => read(rows, events).pendingDeliveries(now, limit),
+    pendingSpawns: (now, limit) => read(rows, events).pendingSpawns(now, limit),
+    livePeerIds: (after, limit) => read(rows, events).livePeerIds(after, limit),
     messagePage: (query) => read(rows, events).messagePage(query),
     transaction: (_locks, action) =>
       queue("transaction", async () => {
@@ -185,17 +216,42 @@ const messageIndexMigration = {
   ],
 };
 
-export function createPostgresCoordinationRepository(pg: PgPool, orgId: string): CoordinationRepository {
+const spawnEligibility =
+  "GREATEST((json->>'leaseUntil')::bigint, CASE WHEN json->>'state'='failed' THEN (json->>'updatedAt')::bigint + 5000 ELSE 0 END)";
+const spawnIndexMigration = {
+  id: "coordination/0004-spawn-recovery-index",
+  statements: [
+    `CREATE INDEX IF NOT EXISTS coordination_pending_spawns ON coordination_records
+    (org_id, (${spawnEligibility}), id COLLATE "C") WHERE kind='spawn' AND json->>'state' IN ('reserved', 'provisioning', 'failed')`,
+  ],
+};
+
+export function createPostgresCoordinationRepository(
+  pg: PgPool,
+  orgId: string,
+  opts: { postgresSessions?: boolean } = {},
+): CoordinationRepository {
   if (!orgId) throw new Error("coordination requires an organization");
   pg.registerMigration(migration);
   pg.registerMigration(deliveryIndexMigration);
   pg.registerMigration(messageIndexMigration);
+  pg.registerMigration(spawnIndexMigration);
+  const peerPageMigration = {
+    id: "coordination/0008-live-peer-page",
+    statements: [
+      `CREATE INDEX IF NOT EXISTS coordination_live_peer_page ON coordination_records
+      (org_id, id COLLATE "C") WHERE kind='peer' AND json->>'state'<>'deleted'`,
+    ],
+  };
+  pg.registerMigration(peerPageMigration);
   let initializing: Promise<void> | undefined;
   const ready = () =>
     (initializing ??= pg
       .migrate(migration)
       .then(() => pg.migrate(deliveryIndexMigration))
       .then(() => pg.migrate(messageIndexMigration))
+      .then(() => pg.migrate(spawnIndexMigration))
+      .then(() => pg.migrate(peerPageMigration))
       .catch((error) => {
         initializing = undefined;
         throw error;
@@ -207,6 +263,15 @@ export function createPostgresCoordinationRepository(pg: PgPool, orgId: string):
       return pg.q(sql, values);
     };
     return {
+      async livePeerIds(after, limit) {
+        eventWindow(0, limit);
+        const rows = await query(
+          `SELECT id FROM coordination_records WHERE org_id=$1 AND kind='peer'
+          AND json->>'state'<>'deleted' AND id COLLATE "C">$2 COLLATE "C" ORDER BY id COLLATE "C" LIMIT $3`,
+          [orgId, after, limit],
+        );
+        return rows.map((row) => row.id as string);
+      },
       async get(kind, id) {
         const result = await query("SELECT json FROM coordination_records WHERE org_id=$1 AND kind=$2 AND id=$3", [
           orgId,
@@ -238,6 +303,16 @@ export function createPostgresCoordinationRepository(pg: PgPool, orgId: string):
              AND json->>'state' IN ('queued', 'delivered', 'blocked')
              AND (json->>'leaseUntil')::bigint <= $2
            ORDER BY (json->>'updatedAt')::bigint, id COLLATE "C" LIMIT $3`,
+          [orgId, now, limit],
+        );
+        return result.map((row) => row.json);
+      },
+      async pendingSpawns(now, limit) {
+        eventWindow(now, limit);
+        const result = await query(
+          `SELECT json FROM coordination_records WHERE org_id=$1 AND kind='spawn'
+          AND json->>'state' IN ('reserved', 'provisioning', 'failed') AND ${spawnEligibility} <= $2
+          ORDER BY ${spawnEligibility}, id COLLATE "C" LIMIT $3`,
           [orgId, now, limit],
         );
         return result.map((row) => row.json);
@@ -293,6 +368,14 @@ export function createPostgresCoordinationRepository(pg: PgPool, orgId: string):
         }
         return action({
           ...read(client),
+          ...(opts.postgresSessions
+            ? {
+                sessionExists: async (id: string) => {
+                  const result = await client.query("SELECT 1 FROM sessions WHERE id=$1", [id]);
+                  return result.rows.length > 0;
+                },
+              }
+            : {}),
           async put(kind, row) {
             await client.query(
               "INSERT INTO coordination_records (org_id, kind, id, json) VALUES ($1,$2,$3,$4) ON CONFLICT (org_id,kind,id) DO UPDATE SET json=EXCLUDED.json",

@@ -5,6 +5,7 @@ import { createDeviceFlowCutoverStore } from "../src/credentials/device-flow-cut
 import { createTurnSandboxes, type TurnSandboxContext } from "../src/core/orchestrator/sandboxes.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import {
   createSandboxResources,
   type SandboxResource,
@@ -77,6 +78,36 @@ function fixture(configure?: (backend: Sandbox) => void, legacyScopes = ["person
   const layers = [{ scopeId: "personal:alice", mode: "rw" as const, mountPath: "/" }];
   return { records, defaults, routes, resources, router, provisioned, layers, backend, options, rollout };
 }
+
+test("reserved sandbox creation retries one durable resource after provisioning failure", async () => {
+  const f = fixture();
+  const original = f.backend.provision;
+  let fail = true;
+  f.backend.provision = async (...args) => {
+    const handle = await original(...args);
+    if (fail) {
+      fail = false;
+      throw new Error("lost provision response");
+    }
+    return handle;
+  };
+  const id = randomUUID();
+  await assert.rejects(f.resources.create("alice", "personal:alice", "local", "worker", id), /lost provision response/);
+  assert.equal((await f.records.get(id))?.state, "failed");
+  const restarted = createSandboxResources(f.options);
+  const results = await Promise.all(
+    Array.from({ length: 20 }, (_, i) =>
+      (i % 2 ? f.resources : restarted).create("alice", "personal:alice", "local", "worker", id),
+    ),
+  );
+  assert.ok(results.every((record) => record.id === id && record.state === "ready" && !record.error));
+  assert.deepEqual(f.provisioned, [`sandbox-${id}`, `sandbox-${id}`]);
+  assert.equal((await f.records.all()).filter((record) => !record.legacy).length, 1);
+  await assert.rejects(f.resources.create("alice", "personal:alice", "local", "other", id), /conflicts/);
+  await assert.rejects(f.resources.create("admin", "personal:bob", "local", "worker", id), /conflicts/);
+  await f.resources.retire("alice", id);
+  await assert.rejects(f.resources.create("alice", "personal:alice", "local", "worker", id), /conflicts/);
+});
 
 test("blank sandbox identities coexist and default changes never copy files or redirect existing handles", async () => {
   const { resources, router, layers } = fixture();
@@ -162,46 +193,48 @@ test("listing an untouched scope never invents a legacy machine", async () => {
   await assert.rejects(resources.create("alice", "personal:alice", "toString"), /unavailable/);
 });
 
-test("turn default changes invalidate cached provisioning while explicit calls dedupe and cleanup each computer once", async () => {
-  const { resources, router, layers, backend } = fixture();
-  const released: string[] = [];
-  backend.teardown = async (handle) => {
-    released.push(handle.id);
-  };
-  const a = await resources.create("alice", "personal:alice", "local");
-  const b = await resources.create("alice", "personal:alice", "local");
-  await resources.setDefault("alice", "personal:alice", a.id);
-  const turn = createTurnSandboxes({
-    deps: { sandbox: router, sandboxResources: resources },
-    input: { origin: { kind: "user" } },
-    actor: { id: "alice", type: "internal" },
-    session: { id: "s" },
-    resolution: { layers },
-    scopeId: "personal:alice",
-    memoryScopeId: "personal:alice",
-    transferId: "t",
-    turnSessionDir: "turn/s",
-    turnFilesDir: "turn/s/t",
-    connectorEnv: { AGENT_API_TOKEN: "scope-token" },
-    ownerAuthAvailable: false,
-    ownerEnvCredentialIds: [],
-    credentialCutoverServices: [],
-    visibleSkills: [],
-    visibleSkillsForTurn: async () => [],
-    emitGapWork: () => {},
-    perf: { credsMs: 0 },
-  } as unknown as TurnSandboxContext);
-  const old = await turn.provision();
-  await resources.setDefault("alice", "personal:alice", b.id);
-  turn.invalidateProvision();
-  const next = await turn.provision();
-  assert.notEqual(old.id, next.id);
-  assert.equal((await router.run(old, "still old")).stdout, old.id);
-  const [x, y] = await Promise.all([turn.provisionResource(a.id), turn.provisionResource(a.id)]);
-  assert.equal(x, y);
-  await turn.reclaimBox();
-  assert.deepEqual(released.sort(), [a.backingScopeId, b.backingScopeId].sort());
-});
+for (const bound of [false, true]) {
+  test(`turn provisioning honors session binding across default changes (bound=${bound})`, async () => {
+    const { resources, router, layers, backend } = fixture();
+    const released: string[] = [];
+    backend.teardown = async (handle) => {
+      released.push(handle.id);
+    };
+    const a = await resources.create("alice", "personal:alice", "local");
+    const b = await resources.create("alice", "personal:alice", "local");
+    await resources.setDefault("alice", "personal:alice", a.id);
+    const turn = createTurnSandboxes({
+      deps: { sandbox: router, sandboxResources: resources, sessionSandboxId: async () => (bound ? a.id : undefined) },
+      input: { origin: { kind: "user" } },
+      actor: { id: "alice", type: "internal" },
+      session: { id: "s" },
+      resolution: { layers },
+      scopeId: "personal:alice",
+      memoryScopeId: "personal:alice",
+      transferId: "t",
+      turnSessionDir: "turn/s",
+      turnFilesDir: "turn/s/t",
+      connectorEnv: { AGENT_API_TOKEN: "scope-token" },
+      ownerAuthAvailable: false,
+      ownerEnvCredentialIds: [],
+      credentialCutoverServices: [],
+      visibleSkills: [],
+      visibleSkillsForTurn: async () => [],
+      emitGapWork: () => {},
+      perf: { credsMs: 0 },
+    } as unknown as TurnSandboxContext);
+    const old = await turn.provision();
+    await resources.setDefault("alice", "personal:alice", b.id);
+    turn.invalidateProvision();
+    const next = await turn.provision();
+    assert.equal(old.id === next.id, bound);
+    assert.equal((await router.run(old, "still old")).stdout, old.id);
+    const [x, y] = await Promise.all([turn.provisionResource(a.id), turn.provisionResource(a.id)]);
+    assert.equal(x, y);
+    await turn.reclaimBox();
+    assert.deepEqual(released.sort(), (bound ? [a.backingScopeId] : [a.backingScopeId, b.backingScopeId]).sort());
+  });
+}
 
 test("retirement refuses the default, waits for an active command, and prevents future execution", async () => {
   const { resources, router, backend, layers } = fixture();

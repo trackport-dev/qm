@@ -77,6 +77,33 @@ test("a hanging abort() does not block the grace race", async () => {
   assert.equal(outcome, "abandoned");
 });
 
+test("abandoned prompt remains observable until its underlying operation settles", async () => {
+  let finish!: () => void;
+  const operation = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  let tracked: Promise<void> | undefined;
+  const outcome = await raceTurnWallClock(operation, {
+    capMs: 5,
+    graceMs: 5,
+    abort: async () => {},
+    onExecutionPending(pending) {
+      tracked = pending;
+    },
+  });
+  assert.equal(outcome, "abandoned");
+  assert.equal(tracked, operation);
+  let settled = false;
+  void tracked!.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  finish();
+  await tracked;
+  assert.equal(settled, true);
+});
+
 test("extendMs pushes the deadline while it returns time; prompt settling during an extension → ok", async () => {
   let release!: () => void;
   const prompting = new Promise<void>((resolve) => {

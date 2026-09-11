@@ -34,6 +34,7 @@ export interface Run {
   createdAt: number;
   startedAt: number | null;
   finishedAt: number | null;
+  availableAt?: number;
 }
 
 export interface EnqueueInput {
@@ -61,6 +62,7 @@ export interface RunStore {
   heartbeat(runId: string, leaseToken: string, ttlMs: number): Promise<boolean>;
 
   releaseLease(runId: string, leaseToken: string): Promise<boolean>;
+  defer(runId: string, leaseToken: string, delayMs: number): Promise<boolean>;
 
   complete(runId: string, leaseToken: string, result: TurnResult): Promise<boolean>;
 

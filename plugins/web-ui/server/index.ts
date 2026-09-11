@@ -1117,6 +1117,27 @@ const apiRoutes: readonly WebRoute[] = [
   },
   {
     method: "GET",
+    path: "/api/peers/:id/subtree",
+    handle: async (c) =>
+      relayCore(
+        c.res,
+        "GET",
+        `/v1/peers/${encodeURIComponent(c.params.id!)}/subtree?principalId=${encodeURIComponent(c.user)}`,
+      ),
+  },
+  {
+    method: "POST",
+    path: "/api/peers/:id/lifecycle",
+    handle: async (c) =>
+      relayCore(
+        c.res,
+        "POST",
+        `/v1/peers/${encodeURIComponent(c.params.id!)}/lifecycle?principalId=${encodeURIComponent(c.user)}`,
+        await readBody(c.req),
+      ),
+  },
+  {
+    method: "GET",
     path: "/api/user-model-auth/status",
     handle: async (c) =>
       relayCore(c.res, "GET", `/v1/user-model-auth/status?principalId=${encodeURIComponent(c.user)}`),

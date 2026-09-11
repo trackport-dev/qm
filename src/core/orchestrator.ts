@@ -500,6 +500,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     },
 
     async handleTurn(input: OrchestratorInput): Promise<TurnResult> {
+      if (deps.sessionCanRun && !(await deps.sessionCanRun(input.conversation.threadRef)))
+        return { status: "refused", reason: "agent is inactive or its computer is not ready" };
       if (input.origin.kind === "peer" && !(await deps.authorizePeerTurn?.(input)))
         return { status: "refused", reason: "peer execution authority is no longer valid" };
       await deps.refreshModels?.();
@@ -2840,6 +2842,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ...(codexTurnAuth ? { codexAuth: codexTurnAuth } : {}),
             ...(input.runId ? { runId: input.runId } : {}),
             cancel: turnAbort.signal,
+            onExecutionPending: input.onExecutionPending,
             input: harnessInput,
             ...(!partial && messageTs ? { triggerTs: messageTs } : {}),
             ...(!partial && entryTs ? { entryTs } : {}),

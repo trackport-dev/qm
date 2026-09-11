@@ -70,6 +70,7 @@ export function withTapedEntryMirrors(turn: HarnessTurnInput): HarnessTurnInput 
 export function harnessToolContext(turn: HarnessTurnInput): ToolContextRef {
   return {
     current: turn.tools,
+    onExecutionPending: turn.onExecutionPending,
     runtimeRunId: turn.runId,
     runtimeActorId: turn.runtimeActorId,
     pendingApprovals: [],

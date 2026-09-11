@@ -2,6 +2,11 @@ import { createRuntimeService } from "./harness/runtime-control.ts";
 import { createPeerIdentity, type PeerIdentity } from "./coordination/identity.ts";
 import { createPeerBoard, type PeerBoard } from "./coordination/board.ts";
 import { createPeerDeliveryLedger } from "./coordination/delivery.ts";
+import { createPeerSpawning, type PeerSpawning } from "./coordination/spawning.ts";
+import { createPeerSpawnWorker, type PeerSpawnWorker } from "./coordination/spawn-worker.ts";
+import { createPeerLifecycle, type PeerLifecycle } from "./coordination/lifecycle.ts";
+import { createPeerExecution } from "./coordination/execution.ts";
+import { createMemoryPeerExecutionStore, createPostgresPeerExecutionStore } from "./coordination/execution-store.ts";
 import { createPeerDispatcher, type PeerDispatcher } from "./coordination/dispatcher.ts";
 import type { Peer, PeerAuthority } from "./coordination/types.ts";
 import {
@@ -409,6 +414,10 @@ export interface BuiltApp {
   peerIdentity?: PeerIdentity;
   peerBoard?: PeerBoard;
   peerDispatcher?: PeerDispatcher;
+  peerSpawning?: PeerSpawning;
+  peerSpawnWorker?: PeerSpawnWorker;
+  peerLifecycle?: PeerLifecycle;
+  peerExecution?: import("./coordination/execution.ts").PeerExecutionService;
   app: App;
   screenSecurity?: SecurityScreenProbe;
   deploymentLayer: DeploymentLayerRuntime;
@@ -541,7 +550,9 @@ export function buildApp(
   });
   const pgArtifactMap = config.databaseUrl ? createPostgresMapFactory(config.databaseUrl) : null;
   const coordinationRepository = pgArtifactMap
-    ? createPostgresCoordinationRepository(pgArtifactMap.pool, config.orgId)
+    ? createPostgresCoordinationRepository(pgArtifactMap.pool, config.orgId, {
+        postgresSessions: config.sessionStore === "postgres",
+      })
     : createMemoryCoordinationRepository();
   const peerBoard = config.coordinationEnabled ? createPeerBoard(coordinationRepository) : undefined;
   const peerDeliveryLedger = config.coordinationEnabled ? createPeerDeliveryLedger(coordinationRepository) : undefined;
@@ -1271,6 +1282,24 @@ export function buildApp(
       ? createPostgresRunStore(requireDbUrl("RUN_STORE"), { maxClaims: config.maxClaims })
       : createMemoryRunStore({ maxClaims: config.maxClaims });
   const runs: RunStore = runStore.runs;
+  const peerExecution = config.coordinationEnabled
+    ? createPeerExecution({
+        repository: coordinationRepository,
+        sessions,
+        runs,
+        store: pgArtifactMap
+          ? createPostgresPeerExecutionStore(
+              pgArtifactMap.pool,
+              config.orgId,
+              config.coordinationConcurrency,
+              config.coordinationTurnLimit,
+            )
+          : createMemoryPeerExecutionStore(config.coordinationConcurrency, config.coordinationTurnLimit),
+      })
+    : undefined;
+  const peerExecutionSweeper = peerExecution
+    ? createSweeper(() => peerExecution.sweep(), 1_000, { label: "peer-execution", immediate: true })
+    : undefined;
   const peerIdentity = config.coordinationEnabled
     ? createPeerIdentity(coordinationRepository, { sessions, runs })
     : undefined;
@@ -1504,6 +1533,12 @@ export function buildApp(
   };
   const orchestratorDeps: OrchestratorDeps = {
     peerIdentity,
+    sessionSandboxId: async (sessionId) => {
+      const peer = await coordinationRepository.get("peer", sessionId);
+      if (!peer?.parentId) return undefined;
+      if (!peer.sandboxId) throw new Error("spawned session computer is not ready");
+      return peer.sandboxId;
+    },
     acceptPeerInput: async (origin, sessionId, runId) => {
       if (origin.recipientSessionId !== sessionId || !peerDeliveryLedger) return;
       await peerDeliveryLedger.consume(origin.deliveryId, sessionId, runId);
@@ -1718,6 +1753,7 @@ export function buildApp(
         })
     : undefined;
   const app = createApp({
+    execution: peerExecution,
     identity,
     ...(config.publicWebUrl ? { publicWebUrl: config.publicWebUrl } : {}),
     sessions,
@@ -2026,6 +2062,38 @@ export function buildApp(
   const peerDispatchSweeper = peerDispatcher
     ? createSweeper(() => peerDispatcher.sweep(), 1_000, { label: "peer-dispatch", immediate: true })
     : undefined;
+  const peerSpawning = config.coordinationEnabled ? createPeerSpawning(coordinationRepository) : undefined;
+  const peerLifecycle = peerSpawning
+    ? createPeerLifecycle({
+        repository: coordinationRepository,
+        spawning: peerSpawning,
+        sessions,
+        runs,
+        signals: runSignals,
+      })
+    : undefined;
+  orchestratorDeps.sessionCanRun = peerLifecycle?.canRun;
+  const peerLifecycleSweeper = peerLifecycle
+    ? createSweeper(() => peerLifecycle.sweep(), 1_000, { label: "peer-lifecycle", immediate: true })
+    : undefined;
+  const peerSpawnWorker =
+    peerDispatcher && peerBoard
+      ? createPeerSpawnWorker({
+          repository: coordinationRepository,
+          sessions,
+          resources: sandboxResources,
+          board: peerBoard,
+          dispatcher: peerDispatcher,
+          authorize: authorizePeer,
+          participants: async (peer) => {
+            const scope = parseScopeId(peer.scopeId);
+            return scope.kind === "group" ? ((await projects.members(scope.ref)) ?? []) : [];
+          },
+        })
+      : undefined;
+  const peerSpawnSweeper = peerSpawnWorker
+    ? createSweeper(() => peerSpawnWorker.sweep(), 1_000, { label: "peer-spawn", immediate: true })
+    : undefined;
   const monitorPoller: MonitorPoller | null =
     processes && supportsProcessSessions(sandbox)
       ? createMonitorPoller({
@@ -2075,6 +2143,7 @@ export function buildApp(
   });
   const workers: Worker[] = Array.from({ length: Math.max(1, config.workers) }, () =>
     createWorker({
+      execution: peerExecution,
       runs,
       sessions,
       orchestrator,
@@ -2147,6 +2216,9 @@ export function buildApp(
       wakeSweep.start();
       orphanedSignalSweeper.start();
       peerDispatchSweeper?.start();
+      peerSpawnSweeper?.start();
+      peerLifecycleSweeper?.start();
+      peerExecutionSweeper?.start();
       drain.start();
     },
     async releaseInFlightRuns() {
@@ -2166,6 +2238,9 @@ export function buildApp(
       wakeSweep.stop();
       orphanedSignalSweeper.stop();
       peerDispatchSweeper?.stop();
+      peerSpawnSweeper?.stop();
+      peerLifecycleSweeper?.stop();
+      peerExecutionSweeper?.stop();
       await Promise.all(workers.map((w) => w.stop(config.shutdownDrainMs))).catch(
         swallowAs("wiring: worker drain failed", undefined),
       );
@@ -2187,6 +2262,10 @@ export function buildApp(
     peerIdentity,
     peerBoard,
     peerDispatcher,
+    peerSpawning,
+    peerSpawnWorker,
+    peerLifecycle,
+    peerExecution,
     ...(screenSecurity ? { screenSecurity } : {}),
     deploymentLayer,
     deploymentLayerStore,
@@ -2341,6 +2420,10 @@ export function serverDeps(
     sessions: built.sessions,
     peerIdentity: built.peerIdentity,
     peerBoard: built.peerBoard,
+    peerSpawning: built.peerSpawning,
+    peerLifecycle: built.peerLifecycle,
+    peerExecution: built.peerExecution,
+    peerSpawnBackend: config.sandboxBackend,
     auditLog: built.auditLog,
     errors: built.errors,
     metrics: built.metrics,

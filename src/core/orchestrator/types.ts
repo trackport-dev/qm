@@ -96,6 +96,7 @@ export interface OrchestratorInput extends Omit<
   finalAttempt?: boolean;
   background?: boolean;
   cancel?: AbortSignal;
+  onExecutionPending?(operation: Promise<void>): void;
   queueMs?: number;
   sessionParticipantIds?: readonly string[];
   scopeVersion?: string;
@@ -162,6 +163,8 @@ export interface OrchestratorDeps {
   runs?: RunStore;
   authorizePeerTurn?(input: OrchestratorInput): Promise<boolean>;
   acceptPeerInput?(origin: PeerOrigin, sessionId: string, runId: string): Promise<void>;
+  sessionSandboxId?(sessionId: string): Promise<string | undefined>;
+  sessionCanRun?(threadRef: string): Promise<boolean>;
   tasks?: TaskStore;
   blobTransfer?: BlobTransferStore;
   processes?: ProcessRegistry;
