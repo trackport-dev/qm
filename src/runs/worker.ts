@@ -9,6 +9,7 @@ import { errorParks, type Run, type RunStore } from "./run-store.ts";
 import type { SessionStore } from "../sessions/session-store.ts";
 import { errMessage, swallow } from "../util/errors.ts";
 import { sleep } from "../util/async.ts";
+import { SWARM_LIMITS } from "../swarms/swarm-store.ts";
 
 export interface ProcessDeps {
   runs: RunStore;
@@ -27,6 +28,7 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
   if (token === null) throw new Error(`processRun called with an unleased run ${run.id}`);
   const intervalMs = deps.heartbeatIntervalMs ?? Math.max(1_000, Math.floor(deps.leaseTtlMs / 3));
   const cancel = new AbortController();
+  const workDeadline = run.request.swarm ? setTimeout(() => cancel.abort(), SWARM_LIMITS.turnMs) : undefined;
   let consecutiveLost = 0;
   let leaseLost = false;
   const beat = setInterval(() => {
@@ -59,6 +61,7 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
     clearInterval(beat);
   };
   try {
+    if (run.request.swarm && run.attempts > 3) throw new NonRetryableTurnError("swarm claim budget exhausted");
     const queueMs = run.startedAt !== null ? Math.max(0, run.startedAt - run.createdAt) : undefined;
     const result = await deps.orchestrator.handleTurn({
       ...run.request,
@@ -91,6 +94,7 @@ export async function processRun(deps: ProcessDeps, run: Run, opts?: { backgroun
     });
     throw err;
   } finally {
+    clearTimeout(workDeadline);
     stopBeat();
   }
 }
