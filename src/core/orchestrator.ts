@@ -1144,6 +1144,13 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         input.surface,
       );
       screenSession.id = session.id;
+      if (actor.type === "internal" && deps.peerIdentity) {
+        await deps.peerIdentity.ensure({
+          id: session.id,
+          scopeId: session.scopeId,
+          authority: { actor, conversation, surface: input.surface ?? "web", scopeVersion: input.scopeVersion },
+        });
+      }
       leaseMs += Date.now() - sessionStart;
       if (!input.sessionParticipantIds?.length && !automatedTurn)
         await deps.sessions.addParticipant(session.id, actor.id);
@@ -1405,6 +1412,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           ? { ...memoryAccess, read: baseRecallScopes, ...(orgMemoryWrite ? { orgWrite: orgMemoryWrite } : {}) }
           : undefined;
         controlClaims = {
+          sessionId: session.id,
           ...scopeAttestation,
           aud: CONTROL_PLANE_AUD,
           exp: Date.now() + CAPABILITY_TTL_MS,

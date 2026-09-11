@@ -9,6 +9,10 @@ function pat(method: string, template: string, field?: Field): Rule {
 }
 
 const USER_SCOPED: Rule[] = [
+  pat("GET", "/v1/peers", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/peers/self", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/peers/:id", { in: "query", name: "principalId" }),
+  pat("PUT", "/v1/peers/:id/character", { in: "query", name: "principalId" }),
   pat("POST", "/v1/auth/broker/sessions/revoke"),
   pat("POST", "/v1/loops", { in: "query", name: "principalId" }),
   pat("GET", "/v1/loops", { in: "query", name: "principalId" }),

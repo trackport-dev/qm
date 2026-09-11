@@ -1,4 +1,10 @@
 import { createRuntimeService } from "./harness/runtime-control.ts";
+import { createPeerIdentity, type PeerIdentity } from "./coordination/identity.ts";
+import {
+  createMemoryCoordinationRepository,
+  createPostgresCoordinationRepository,
+  type CoordinationRepository,
+} from "./coordination/repository.ts";
 import { createPostgresBrokerSessions, type BrokerSessionStore } from "./auth/broker-sessions.ts";
 import { createDirectFileUploads, type DirectFileUploads } from "./files/direct-file-upload.ts";
 import { createPostgresFileUploadStore } from "./files/file-upload-store.ts";
@@ -395,6 +401,8 @@ export function stopWithBackstop(
 }
 
 export interface BuiltApp {
+  coordinationRepository: CoordinationRepository;
+  peerIdentity?: PeerIdentity;
   app: App;
   screenSecurity?: SecurityScreenProbe;
   deploymentLayer: DeploymentLayerRuntime;
@@ -526,6 +534,10 @@ export function buildApp(
       membership.managesArtifactHome!(scopeId, authoredBy ?? "", principalId),
   });
   const pgArtifactMap = config.databaseUrl ? createPostgresMapFactory(config.databaseUrl) : null;
+  const coordinationRepository = pgArtifactMap
+    ? createPostgresCoordinationRepository(pgArtifactMap.pool, config.orgId)
+    : createMemoryCoordinationRepository();
+  const peerIdentity = config.coordinationEnabled ? createPeerIdentity(coordinationRepository) : undefined;
   const artifactMap = <T>(table: string): DurableMap<T> =>
     pgArtifactMap ? pgArtifactMap.map<T>(table) : createMemoryMap<T>();
   setProviderBaseUrls(config.providerBaseUrls);
@@ -1481,6 +1493,7 @@ export function buildApp(
     return broker;
   };
   const orchestratorDeps: OrchestratorDeps = {
+    peerIdentity,
     refreshModels,
     identity,
     resolution,
@@ -2072,6 +2085,8 @@ export function buildApp(
 
   return {
     app,
+    coordinationRepository,
+    peerIdentity,
     ...(screenSecurity ? { screenSecurity } : {}),
     deploymentLayer,
     deploymentLayerStore,
@@ -2224,6 +2239,7 @@ export function serverDeps(
     featureFlags: built.featureFlags,
     egressAudit: built.egressAudit,
     sessions: built.sessions,
+    peerIdentity: built.peerIdentity,
     auditLog: built.auditLog,
     errors: built.errors,
     metrics: built.metrics,

@@ -1,4 +1,5 @@
 import type { RuntimeService } from "../../harness/runtime-types.ts";
+import type { PeerIdentity } from "../../coordination/identity.ts";
 import type { SandboxResources } from "../../sandbox/sandbox-resources.ts";
 import type { AwsRoleBroker } from "../../auth/aws-role-broker.ts";
 import type {
@@ -100,6 +101,7 @@ export interface OrchestratorInput extends Omit<
 }
 
 export interface OrchestratorDeps {
+  peerIdentity?: PeerIdentity;
   refreshModels?: () => Promise<void>;
   identity: IdentityService;
   resolution: ResolutionService;

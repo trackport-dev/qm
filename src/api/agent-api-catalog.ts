@@ -23,6 +23,27 @@ const onPath = (m: string, p: string) => (method: string, pathname: string) => m
 const FAMILIES: AgentApiFamily[] = [
   {
     match: (m, p) =>
+      (m === "GET" && /^\/v1\/peers(?:\/[^/]+)?$/.test(p)) ||
+      (m === "PUT" && /^\/v1\/peers\/[^/]+\/character$/.test(p)),
+    guidance:
+      "Peer identities and character are public within the organization. Character group/role labels describe agents; they do not grant authority. Agents may edit only their own character.",
+    routes: [
+      { method: "GET", path: "/v1/peers/self", summary: "inspect your authenticated session identity and character" },
+      { method: "GET", path: "/v1/peers", summary: "discover organization peers and their public character" },
+      {
+        method: "GET",
+        path: "/v1/peers/:id",
+        summary: "inspect a peer's public character; private transcripts require separate access",
+      },
+      {
+        method: "PUT",
+        path: "/v1/peers/:id/character",
+        summary: "replace your character with {version, character, name?}; stale versions return a conflict",
+      },
+    ],
+  },
+  {
+    match: (m, p) =>
       (m === "GET" && p === "/v1/files/upload-client") ||
       (p === "/v1/files/uploads" && m === "POST") ||
       (/^\/v1\/files\/uploads\/[^/]+$/.test(p) && (m === "GET" || m === "DELETE")) ||

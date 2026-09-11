@@ -1,4 +1,5 @@
 import type { BrokerSessionStore } from "../auth/broker-sessions.ts";
+import type { PeerIdentity } from "../coordination/identity.ts";
 import type { DirectFileUploads } from "../files/direct-file-upload.ts";
 import type { SandboxResources } from "../sandbox/sandbox-resources.ts";
 import type { ModelVerifier } from "../model/model-verification.ts";
@@ -124,6 +125,7 @@ export interface ServerDeps {
   emailAuthDomain?: string;
   rateLimiter?: RateLimiter;
   sessions?: SessionStore;
+  peerIdentity?: PeerIdentity;
   screenSecurity?: SecurityScreenProbe;
   auditLog?: AuditLog;
   errors?: ErrorLog;

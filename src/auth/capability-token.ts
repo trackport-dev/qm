@@ -38,6 +38,7 @@ export interface CapabilityClaims {
   memory?: { write?: ScopeId; orgWrite?: ScopeId; read: ScopeId[] };
   liveActor?: boolean;
   runId?: string;
+  sessionId?: string;
   deployment?: string;
   botActor?: boolean;
   liveAuthor?: boolean;
@@ -93,6 +94,7 @@ export async function verifyCapabilityToken(
   if (claims.blob !== undefined && claims.blob?.dir !== "read" && claims.blob?.dir !== "write") return null;
   if (claims.drop !== undefined && typeof claims.drop !== "string") return null;
   if (claims.runId !== undefined && typeof claims.runId !== "string") return null;
+  if (claims.sessionId !== undefined && (typeof claims.sessionId !== "string" || !claims.sessionId)) return null;
   if (claims.deployment !== undefined && (typeof claims.deployment !== "string" || !claims.deployment)) return null;
   if (now >= claims.exp) return null;
   return claims;
